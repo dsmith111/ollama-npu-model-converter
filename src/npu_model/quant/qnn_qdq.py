@@ -145,9 +145,11 @@ class QnnQdqQuantizer:
         # Step 1: QNN preprocessing
         pp_path = out_dir / f"{name}_preprocessed.onnx"
         try:
-            qnn_preprocess_model(
-                model_input=str(graph_path),
-                model_output=str(pp_path),
+            model_changed = bool(
+                qnn_preprocess_model(
+                    model_input=str(graph_path),
+                    model_output=str(pp_path),
+                )
             )
         except Exception as e:
             raise NpuModelError(
@@ -158,8 +160,19 @@ class QnnQdqQuantizer:
                 cause=e,
             ) from e
 
+        # Use the preprocessed model only when preprocessing actually changed it;
+        # otherwise keep using the original graph (ORT may not emit a file).
+        model_to_quantize = pp_path if model_changed else graph_path
+
+        if model_changed and not pp_path.exists():
+            raise NpuModelError(
+                stage="quant",
+                reason_code="QNN_PREPROCESS_OUTPUT_MISSING",
+                message=f"qnn_preprocess_model reported changes for '{name}' but did not create: {pp_path}",
+            )
+
         # Copy external data alongside preprocessed model
-        if has_external_data:
+        if model_changed and has_external_data:
             for data in out_dir.glob("*.data"):
                 dst = pp_path.parent / data.name
                 if not dst.exists():
@@ -169,7 +182,7 @@ class QnnQdqQuantizer:
         qdq_path = out_dir / f"{name}.qdq.onnx"
         try:
             qdq_config = get_qnn_qdq_config(
-                model_input=str(pp_path),
+                model_input=str(model_to_quantize),
                 calibration_data_reader=calib_data_reader,
                 activation_type=quant_config.get("activation_type", QuantType.QUInt16),
                 weight_type=quant_config.get("weight_type", QuantType.QUInt8),
@@ -179,14 +192,14 @@ class QnnQdqQuantizer:
                 stage="quant",
                 reason_code="QNN_QDQ_CONFIG_FAILED",
                 message=f"get_qnn_qdq_config failed for '{name}': {e}",
-                hint="Calibration data may be incompatible with model inputs.",
+                hint=f"Model used for QDQ config: {model_to_quantize}",
                 cause=e,
             ) from e
 
         # Step 3: Quantize
         try:
             quantize_fn(
-                model_input=str(pp_path),
+                model_input=str(model_to_quantize),
                 model_output=str(qdq_path),
                 quant_config=qdq_config,
             )
@@ -195,7 +208,7 @@ class QnnQdqQuantizer:
                 stage="quant",
                 reason_code="QUANTIZATION_FAILED",
                 message=f"QDQ quantization failed for graph '{name}': {e}",
-                hint="Check model compatibility with QNN QDQ quantization.",
+                hint=f"Model used for quantization: {model_to_quantize}",
                 cause=e,
             ) from e
 
