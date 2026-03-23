@@ -263,23 +263,59 @@ class QnnBackend(Backend):
             if data.exists():
                 total_bytes += data.stat().st_size
         model_gb = total_bytes / (1024**3)
-        if model_gb > 12.0:
+        required_ram_gb = model_gb * 2.0
+
+        # Detect system RAM
+        system_ram_gb = None
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+            class _MEMSTATEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            ms = _MEMSTATEX()
+            ms.dwLength = ctypes.sizeof(_MEMSTATEX)
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                system_ram_gb = ms.ullTotalPhys / (1024**3)
+        except Exception:
+            try:
+                import os as _os2
+                system_ram_gb = (_os2.sysconf("SC_PAGE_SIZE") * _os2.sysconf("SC_PHYS_PAGES")) / (1024**3)
+            except Exception:
+                pass
+
+        if system_ram_gb is not None and required_ram_gb > system_ram_gb:
             raise NpuModelError(
                 stage="backend",
                 reason_code="MODEL_TOO_LARGE_FOR_CONTEXT_CACHE",
                 message=(
-                    f"QDQ model is {model_gb:.1f} GB — too large for on-device "
-                    f"context-cache compilation. ORT loads the entire model to "
-                    f"compile HTP context binaries."
+                    f"QDQ model is {model_gb:.1f} GB — context-cache compilation needs "
+                    f"~{required_ram_gb:.0f} GB RAM but this system has {system_ram_gb:.0f} GB."
                 ),
                 hint=(
-                    "The FP32 QDQ model is too large for this device's memory.\n"
                     "Options:\n"
-                    "  1. Use a smaller model\n"
-                    "  2. Compile context-cache on a machine with more RAM\n"
-                    "  3. Use a prebuilt model with context cache already generated:\n"
-                    "     npu-model convert --mode prebuilt-ort-genai --input <dir> ..."
+                    "  1. Compile context-cache on a machine with more RAM\n"
+                    "  2. Use a smaller model\n"
+                    "  3. Use a prebuilt model: --mode prebuilt-ort-genai"
                 ),
+            )
+        elif model_gb > 4.0:
+            import logging
+            logging.getLogger("npu_model").warning(
+                "QDQ model is %.1f GB. Context-cache compilation loads the entire model "
+                "into RAM (~%.0f GB needed). If this crashes, compile on a bigger machine.",
+                model_gb, required_ram_gb,
             )
 
         # Pre-flight: check for incompatible quantization formats

@@ -377,45 +377,76 @@ def convert_model(
         try:
             mem_info = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
         except (AttributeError, ValueError):
-            mem_info = None  # Windows — no sysconf
+            # Windows — use ctypes to get total physical memory
+            mem_info = None
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                mem_status = MEMORYSTATUSEX()
+                mem_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
+                    mem_info = mem_status.ullTotalPhys
+            except Exception:
+                pass
 
         model_gb = total_model_bytes / (1024**3)
+        required_ram_gb = model_gb * 2.5
+        system_ram_gb = mem_info / (1024**3) if mem_info else None
 
-        # Heuristic: quantization needs ~2-3x model size in RAM
-        if model_gb > 4.0:
+        # Only block if we can detect RAM and model won't fit
+        if system_ram_gb is not None and required_ram_gb > system_ram_gb:
+            _log.warning(
+                "Model size is %.1f GB (needs ~%.0f GB RAM). "
+                "System has %.0f GB total RAM.",
+                model_gb, required_ram_gb, system_ram_gb,
+            )
+            _input_escaped = input_spec.replace("'", "\\'")
+            raise NpuModelError(
+                stage="quant",
+                reason_code="MODEL_TOO_LARGE_FOR_QUANTIZATION",
+                message=(
+                    f"Model is {model_gb:.1f} GB — quantization requires ~{required_ram_gb:.0f} GB RAM "
+                    f"but this system has {system_ram_gb:.0f} GB."
+                ),
+                hint=(
+                    "Use a staged workflow across two machines:\n"
+                    "\n"
+                    "Step 1 — On a machine with enough RAM, export + quantize:\n"
+                    f"  npu-model convert --input '{_input_escaped}' "
+                    f"--out .\\handoff --stop-after quantize --keep-work\n"
+                    "\n"
+                    "Step 2 — Copy the handoff_bundle/ folder to the target device.\n"
+                    "\n"
+                    "Step 3 — On the target device (with QNN EP), compile + pack:\n"
+                    f"  npu-model compile-context --input .\\handoff\\handoff_bundle "
+                    f"--out .\\compiled\n"
+                    f"  npu-model pack-ollama --input .\\compiled "
+                    f"--name <ollama-tag> --out .\\publish\n"
+                    "\n"
+                    "Or use a prebuilt model: --mode prebuilt-ort-genai"
+                ),
+            )
+        elif model_gb > 4.0:
             _log.warning(
                 "Model size is %.1f GB. Quantization requires loading the entire model "
-                "into RAM (typically 2-3x model size). On devices with limited memory, "
-                "this may crash silently.", model_gb,
+                "into RAM (typically 2-3x model size = ~%.0f GB). "
+                "If this crashes silently, use --stop-after export for staged workflow.",
+                model_gb, required_ram_gb,
             )
-            if model_gb > 6.0:
-                # Build actionable staged workflow commands
-                _input_escaped = input_spec.replace("'", "\\'")
-                raise NpuModelError(
-                    stage="quant",
-                    reason_code="MODEL_TOO_LARGE_FOR_QUANTIZATION",
-                    message=(
-                        f"Model is {model_gb:.1f} GB — too large to quantize in-memory "
-                        f"on this device. Quantization requires ~{model_gb * 2.5:.0f} GB RAM."
-                    ),
-                    hint=(
-                        "Use a staged workflow across two machines:\n"
-                        "\n"
-                        "Step 1 — On a machine with enough RAM, export only:\n"
-                        f"  npu-model convert --input '{_input_escaped}' "
-                        f"--out .\\handoff --stop-after export --keep-work\n"
-                        "\n"
-                        "Step 2 — Copy the handoff_bundle/ folder to the target device.\n"
-                        "\n"
-                        "Step 3 — On the target device (with QNN EP), compile + pack:\n"
-                        f"  npu-model compile-context --input .\\handoff\\handoff_bundle "
-                        f"--out .\\compiled\n"
-                        f"  npu-model pack-ollama --input .\\compiled "
-                        f"--name <ollama-tag> --out .\\publish\n"
-                        "\n"
-                        "Or use a prebuilt model: --mode prebuilt-ort-genai"
-                    ),
-                )
 
         # Check if the quantizer needs calibration data
         requires_calib = getattr(quantizer, "requires_calibration", True)
