@@ -126,6 +126,57 @@ class QnnBackend(Backend):
         )
 
     # -------------------------------------------------------------------
+    # QNN op compatibility check
+    # -------------------------------------------------------------------
+
+    def _check_qnn_compatible_ops(self, graphs: GraphBundle) -> None:
+        """Check ONNX graphs for ops that are incompatible with QNN HTP.
+
+        MatMulNBits (INT4 weight-only from ORT GenAI builder) is NOT the
+        same as QDQ quantization. QNN HTP needs QuantizeLinear/DequantizeLinear
+        nodes, not MatMulNBits.
+        """
+        try:
+            import onnx
+        except ImportError:
+            return  # can't check without onnx
+
+        _INCOMPATIBLE_OPS = {"MatMulNBits"}
+
+        for name, graph_path in graphs.graphs.items():
+            try:
+                model = onnx.load(str(graph_path), load_external_data=False)
+            except Exception:
+                continue
+
+            incompatible = set()
+            for node in model.graph.node:
+                if node.op_type in _INCOMPATIBLE_OPS:
+                    incompatible.add(node.op_type)
+
+            if incompatible:
+                raise NpuModelError(
+                    stage="backend",
+                    reason_code="INCOMPATIBLE_QUANTIZATION",
+                    message=(
+                        f"Graph '{name}' contains ops incompatible with QNN HTP: "
+                        f"{sorted(incompatible)}"
+                    ),
+                    hint=(
+                        "MatMulNBits is INT4 weight-only quantization (for CPU/DML), "
+                        "NOT QDQ quantization (for QNN HTP).\n\n"
+                        "QNN HTP requires QDQ models with QuantizeLinear/DequantizeLinear nodes.\n"
+                        "These are produced by: qnn_preprocess_model → get_qnn_qdq_config → quantize\n\n"
+                        "To fix:\n"
+                        "  1. Re-export from HF at FP32: --precision fp32\n"
+                        "  2. Quantize with QNN QDQ: --quant qnn-qdq\n"
+                        "  3. Then compile context-cache\n\n"
+                        "The ORT GenAI builder's --precision int4 produces MatMulNBits,\n"
+                        "which is a different format not supported by QNN HTP."
+                    ),
+                )
+
+    # -------------------------------------------------------------------
     # compile (real compilation via ORT QNN EP context caching)
     # -------------------------------------------------------------------
 
@@ -203,6 +254,37 @@ class QnnBackend(Backend):
         compile_dir = out_dir / "context_cache_compile"
         compile_dir.mkdir(exist_ok=True)
 
+        # Pre-flight: check model size vs available memory
+        total_bytes = 0
+        for name, src_path in graphs.graphs.items():
+            if src_path.exists():
+                total_bytes += src_path.stat().st_size
+            data = src_path.parent / f"{src_path.name}.data"
+            if data.exists():
+                total_bytes += data.stat().st_size
+        model_gb = total_bytes / (1024**3)
+        if model_gb > 12.0:
+            raise NpuModelError(
+                stage="backend",
+                reason_code="MODEL_TOO_LARGE_FOR_CONTEXT_CACHE",
+                message=(
+                    f"QDQ model is {model_gb:.1f} GB — too large for on-device "
+                    f"context-cache compilation. ORT loads the entire model to "
+                    f"compile HTP context binaries."
+                ),
+                hint=(
+                    "The FP32 QDQ model is too large for this device's memory.\n"
+                    "Options:\n"
+                    "  1. Use a smaller model\n"
+                    "  2. Compile context-cache on a machine with more RAM\n"
+                    "  3. Use a prebuilt model with context cache already generated:\n"
+                    "     npu-model convert --mode prebuilt-ort-genai --input <dir> ..."
+                ),
+            )
+
+        # Pre-flight: check for incompatible quantization formats
+        self._check_qnn_compatible_ops(graphs)
+
         backend_path = target.params.get("backend_path", "QnnHtp.dll")
         embed_mode = config.get("ep_context_embed_mode", "0")
 
@@ -222,13 +304,18 @@ class QnnBackend(Backend):
         context_errors: list[str] = []
         for name, src_path in graphs.graphs.items():
             graph_in_compile = compile_dir / src_path.name
-            ctx_output_path = compile_dir / f"{graph_in_compile.stem}_ctx.onnx"
+
+            # ep.context_file_path: ORT uses this as the output path for the
+            # generated context model. Pass the compile directory — ORT will
+            # create <model>_ctx.onnx and <model>_ctx_qnn.bin alongside it.
+            # Some ORT versions expect a file path, others a directory.
+            ctx_output_path = str(compile_dir / f"{graph_in_compile.stem}_ctx.onnx")
 
             sess_options = ort.SessionOptions()
             apply_npu_only_session_options(sess_options)
             apply_context_cache_session_options(
                 sess_options,
-                context_file_path=str(ctx_output_path),
+                context_file_path=ctx_output_path,
                 embed_mode=embed_mode,
             )
 
@@ -242,13 +329,16 @@ class QnnBackend(Backend):
                     qnn_provider_opts[k[4:]] = str(v)
 
             try:
-                _sess = ort.InferenceSession(
+                sess = ort.InferenceSession(
                     str(graph_in_compile),
                     sess_options=sess_options,
                     providers=["QNNExecutionProvider"],
                     provider_options=[qnn_provider_opts],
                 )
-                del _sess
+                # Explicitly close the session to ensure context files are flushed
+                del sess
+                import gc
+                gc.collect()
             except Exception as e:
                 context_errors.append(f"{name} ({src_path.name}): {e}")
 
@@ -276,11 +366,13 @@ class QnnBackend(Backend):
             if not p.is_file():
                 continue
             if "_ctx" in p.stem and p.suffix == ".onnx":
+                if p.stat().st_size == 0:
+                    continue  # skip empty ctx files (generation failed silently)
                 dst = artifacts_dir / p.name
                 shutil.copy2(p, dst)
                 key = p.stem.replace("_ctx", "")
                 ctx_graphs[key] = dst
-            elif p.suffix == ".bin":
+            elif p.suffix == ".bin" and p.stat().st_size > 0:
                 shutil.copy2(p, artifacts_dir / p.name)
 
         # Copy extra files (genai_config, etc.) from adapter
@@ -290,16 +382,34 @@ class QnnBackend(Backend):
                 if not dst.exists():
                     shutil.copy2(p, dst)
 
-        # HARD REQUIREMENT: context-cache must produce ctx artifacts
+        # HARD REQUIREMENT: context-cache must produce valid ctx artifacts
         if not ctx_graphs:
+            # Diagnose what went wrong
+            all_ctx_files = list(compile_dir.glob("*_ctx*"))
+            all_bins = list(compile_dir.glob("*.bin"))
+            diag = []
+            for f in all_ctx_files:
+                diag.append(f"  {f.name}: {f.stat().st_size} bytes")
+            for f in all_bins:
+                diag.append(f"  {f.name}: {f.stat().st_size} bytes")
+
             raise NpuModelError(
                 stage="backend",
                 reason_code="NO_CTX_ARTIFACTS",
-                message="Context-cache compilation completed but no *_ctx.onnx artifacts were generated.",
+                message=(
+                    "Context-cache compilation completed but no valid *_ctx.onnx "
+                    "artifacts were generated (files may be 0 bytes)."
+                ),
                 hint=(
-                    "ORT session creation did not produce context-cache output files. "
-                    "This usually means the model was not accepted by QNN HTP. "
-                    "Ensure the model is properly QDQ-quantized with calibration data."
+                    "Generated files in compile dir:\n"
+                    + ("\n".join(diag) if diag else "  (none)")
+                    + "\n\n"
+                    "A 0-byte _ctx.onnx typically means ORT created the file but the "
+                    "context serialization failed (e.g. protobuf >2GB limit).\n\n"
+                    "Possible fixes:\n"
+                    "  - Try ep_context_embed_mode=1 (embeds context in the ONNX)\n"
+                    "  - Ensure the QDQ model's external data (.onnx.data) is co-located\n"
+                    "  - Check ORT/QNN version compatibility"
                 ),
             )
 

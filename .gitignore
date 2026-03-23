@@ -27,3 +27,5 @@ Thumbs.db
 out/
 *.onnx
 cache_dir/
+*.log
+compiled*/

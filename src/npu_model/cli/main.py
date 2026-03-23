@@ -387,6 +387,16 @@ def compile_context(
 
         rprint(f"[dim]Compiling with:[/dim] {ts.normalized_repr()}")
 
+        # Show model size before compilation
+        total_bytes = 0
+        for gname, gpath in graphs.graphs.items():
+            if gpath.exists():
+                total_bytes += gpath.stat().st_size
+                data = gpath.parent / f"{gpath.name}.data"
+                if data.exists():
+                    total_bytes += data.stat().st_size
+        rprint(f"[dim]Model size:[/dim] {total_bytes / (1024**3):.1f} GB")
+
         out = out.expanduser().resolve()
         prepared = backend_plugin.compile(
             graphs, out,

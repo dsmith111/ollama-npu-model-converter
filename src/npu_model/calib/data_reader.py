@@ -44,7 +44,12 @@ def _load_tokenizer(tokenizer_dir: Path) -> Any:
     """Load a tokenizer from a directory, trying transformers first."""
     try:
         from transformers import AutoTokenizer
-        return AutoTokenizer.from_pretrained(str(tokenizer_dir))
+        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir))
+        # Many models (GPT-2, Phi-2, CodeGen) don't define a pad token.
+        # For calibration padding we need one — use eos_token as fallback.
+        if tok.pad_token is None and tok.eos_token is not None:
+            tok.pad_token = tok.eos_token
+        return tok
     except ImportError:
         pass
 
