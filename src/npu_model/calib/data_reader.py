@@ -69,24 +69,34 @@ def _load_tokenizer(tokenizer_dir: Path) -> Any:
     )
 
 
+# Inputs populated from tokenizer output; everything else is synthesized.
+_TOKENIZER_INPUT_NAMES = {"input_ids", "attention_mask", "position_ids", "token_type_ids"}
+
+
 def _get_onnx_input_info(onnx_path: Path) -> dict[str, dict[str, Any]]:
-    """Inspect ONNX graph inputs to determine names and dtypes."""
+    """Inspect ONNX graph inputs — returns **all** inputs with dtype and shape.
+
+    Returns a dict keyed by input name. Each value has:
+      - ``dtype``: numpy dtype string (e.g. ``"float32"``).
+      - ``shape``: list of ints for concrete dims, ``None`` entries for
+        symbolic/unknown dims, or ``None`` if shape is unavailable.
+    """
     try:
         import onnx
         from onnx import TensorProto
     except ImportError:
         # Fallback: assume standard LLM input names
         return {
-            "input_ids": {"dtype": "int64"},
-            "attention_mask": {"dtype": "int64"},
+            "input_ids": {"dtype": "int64", "shape": None},
+            "attention_mask": {"dtype": "int64", "shape": None},
         }
 
     try:
         model = onnx.load(str(onnx_path), load_external_data=False)
     except Exception:
         return {
-            "input_ids": {"dtype": "int64"},
-            "attention_mask": {"dtype": "int64"},
+            "input_ids": {"dtype": "int64", "shape": None},
+            "attention_mask": {"dtype": "int64", "shape": None},
         }
 
     _ONNX_DTYPE_MAP = {
@@ -96,18 +106,30 @@ def _get_onnx_input_info(onnx_path: Path) -> dict[str, dict[str, Any]]:
         TensorProto.FLOAT16: "float16",
     }
 
-    # Only return inputs that look like tokenizer outputs
-    _CALIB_INPUT_NAMES = {"input_ids", "attention_mask", "position_ids", "token_type_ids"}
     info: dict[str, dict[str, Any]] = {}
     for inp in model.graph.input:
-        if inp.name in _CALIB_INPUT_NAMES and inp.type.HasField("tensor_type"):
+        if inp.type.HasField("tensor_type"):
             dtype_int = inp.type.tensor_type.elem_type
-            dtype_str = _ONNX_DTYPE_MAP.get(dtype_int, "int64")
-            info[inp.name] = {"dtype": dtype_str}
+            dtype_str = _ONNX_DTYPE_MAP.get(dtype_int, "float32")
+
+            shape: list[int | None] | None = None
+            tensor_shape = inp.type.tensor_type.shape
+            if tensor_shape is not None:
+                dims: list[int | None] = []
+                for dim in tensor_shape.dim:
+                    if dim.dim_value > 0:
+                        dims.append(dim.dim_value)
+                    else:
+                        dims.append(None)  # symbolic / unknown
+                shape = dims
+
+            info[inp.name] = {"dtype": dtype_str, "shape": shape}
 
     if not info:
-        # No recognized inputs — use defaults
-        info = {"input_ids": {"dtype": "int64"}, "attention_mask": {"dtype": "int64"}}
+        info = {
+            "input_ids": {"dtype": "int64", "shape": None},
+            "attention_mask": {"dtype": "int64", "shape": None},
+        }
 
     return info
 
@@ -141,6 +163,17 @@ def build_calibration_reader(
     tokenizer = _load_tokenizer(tokenizer_dir)
     input_info = _get_onnx_input_info(onnx_path)
 
+    # Separate tokenizer-derived inputs from synthetic ones (e.g. past_key_values)
+    tokenizer_inputs = {k: v for k, v in input_info.items() if k in _TOKENIZER_INPUT_NAMES}
+    synthetic_inputs = {k: v for k, v in input_info.items() if k not in _TOKENIZER_INPUT_NAMES}
+
+    if synthetic_inputs:
+        _log.info(
+            "Model has %d non-tokenizer inputs that will be zero-filled for calibration: %s",
+            len(synthetic_inputs),
+            ", ".join(sorted(synthetic_inputs)),
+        )
+
     # Take up to num_samples prompts
     prompts = prompts[:num_samples]
 
@@ -157,7 +190,7 @@ def build_calibration_reader(
                 return_tensors="np",
             )
             feed: dict[str, np.ndarray] = {}
-            for name, info in input_info.items():
+            for name, info in tokenizer_inputs.items():
                 if name in encoded:
                     arr = encoded[name]
                 elif name == "position_ids" and "input_ids" in encoded:
@@ -178,6 +211,9 @@ def build_calibration_reader(
 
                 feed[name] = arr
 
+            # Synthesize zero-filled tensors for non-tokenizer inputs
+            _add_synthetic_feeds(feed, synthetic_inputs, batch_size)
+
             if feed:
                 feeds.append(feed)
 
@@ -191,15 +227,18 @@ def build_calibration_reader(
             mask = [1] * (max_seq_len - pad_len) + [0] * pad_len
 
             feed = {}
-            if "input_ids" in input_info:
-                dtype = getattr(np, input_info["input_ids"]["dtype"])
+            if "input_ids" in tokenizer_inputs:
+                dtype = getattr(np, tokenizer_inputs["input_ids"]["dtype"])
                 feed["input_ids"] = np.array([ids], dtype=dtype)
-            if "attention_mask" in input_info:
-                dtype = getattr(np, input_info["attention_mask"]["dtype"])
+            if "attention_mask" in tokenizer_inputs:
+                dtype = getattr(np, tokenizer_inputs["attention_mask"]["dtype"])
                 feed["attention_mask"] = np.array([mask], dtype=dtype)
-            if "position_ids" in input_info:
-                dtype = getattr(np, input_info["position_ids"]["dtype"])
+            if "position_ids" in tokenizer_inputs:
+                dtype = getattr(np, tokenizer_inputs["position_ids"]["dtype"])
                 feed["position_ids"] = np.arange(max_seq_len, dtype=dtype).reshape(1, -1)
+
+            # Synthesize zero-filled tensors for non-tokenizer inputs
+            _add_synthetic_feeds(feed, synthetic_inputs, batch_size)
 
             if feed:
                 feeds.append(feed)
@@ -214,3 +253,37 @@ def build_calibration_reader(
 
     _log.info("Built %d calibration samples (seq_len=%d)", len(feeds), max_seq_len)
     return OnnxCalibrationDataReader(feeds)
+
+
+def _add_synthetic_feeds(
+    feed: dict[str, np.ndarray],
+    synthetic_inputs: dict[str, dict[str, Any]],
+    batch_size: int,
+) -> None:
+    """Add zero-filled tensors for non-tokenizer graph inputs.
+
+    Handles ``past_key_values.*`` and any other inputs not produced by the
+    tokenizer.  Shapes are taken from the ONNX graph metadata; any remaining
+    symbolic (``None``) dims are resolved to ``batch_size`` for the first
+    axis and ``1`` for all others.
+    """
+    for name, info in synthetic_inputs.items():
+        shape = info.get("shape")
+        if shape is None:
+            _log.warning(
+                "Skipping synthetic input '%s': no shape information available.", name,
+            )
+            continue
+
+        # Resolve any remaining symbolic dims
+        resolved: list[int] = []
+        for i, dim in enumerate(shape):
+            if dim is not None:
+                resolved.append(dim)
+            elif i == 0:
+                resolved.append(batch_size)  # batch axis
+            else:
+                resolved.append(1)  # conservative default for unknown dims
+
+        dtype = getattr(np, info["dtype"])
+        feed[name] = np.zeros(resolved, dtype=dtype)

@@ -58,6 +58,13 @@ def fix_dynamic_shapes(
         )
 
     # Common dynamic dim names → concrete values
+    #
+    # NOTE: past_sequence_length is mapped to sequence_length here for
+    # compile-time shape fixing (QNN HTP requires fully static shapes).
+    # For calibration, this means KV-cache tensors will be sized at
+    # num_ctx, which may use significant memory.  A future improvement
+    # could separate calibration-time shape policy (small past, e.g. 1)
+    # from compile-time context sizing.
     dim_map: dict[str, int] = {
         "batch_size": batch_size,
         "batch": batch_size,
