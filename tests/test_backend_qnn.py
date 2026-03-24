@@ -240,6 +240,8 @@ class TestOliveQnnLlmQuantizer:
             q.apply(bundle, quant_config={})
         assert exc_info.value.reason_code in (
             "OLIVE_NOT_INSTALLED",
+            "OLIVE_UNSUPPORTED_PYTHON",
+            "OLIVE_PYTHON_NOT_FOUND",
             "OLIVE_MODEL_FAMILY_UNSUPPORTED",
             "OLIVE_RUN_FAILED",
         )

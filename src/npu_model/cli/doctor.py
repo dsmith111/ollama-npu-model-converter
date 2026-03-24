@@ -77,11 +77,11 @@ def _check_olive() -> CheckResult:
 
         ver = getattr(olive, "__version__", "unknown")
         return CheckResult(name="olive-ai", ok=True, detail=f"v{ver}")
-    except ImportError:
+    except Exception as e:
         return CheckResult(
             name="olive-ai",
             ok=False,
-            detail="not installed",
+            detail=f"unavailable ({type(e).__name__})",
             remediation="pip install olive-ai[auto-opt]",
         )
 

@@ -177,6 +177,11 @@ def convert(
     no_cache: bool = typer.Option(False, "--no-cache", help="Force rebuild, ignore conversion cache"),
     keep_work: bool = typer.Option(False, "--keep-work", help="Keep intermediate _work directory after conversion"),
     cache_dir: Optional[Path] = typer.Option(None, "--cache-dir", help="Cache directory for HF downloads"),
+    olive_python: Optional[Path] = typer.Option(
+        None,
+        "--olive-python",
+        help="External Python interpreter used for Olive runs (fallback: NPU_MODEL_OLIVE_PYTHON).",
+    ),
 ) -> None:
     """Convert a model into a runtime bundle.
 
@@ -225,6 +230,7 @@ def convert(
                 "calib_prompts_file": calib_prompts,
                 "calib_samples": calib_samples,
                 "calib_maxlen": calib_maxlen,
+                "olive_python": str(olive_python) if olive_python else None,
             },
             pack_ollama_name=ollama_name if not stop_after else None,
             pack_ollama_opts={"num_ctx": num_ctx, "num_predict": num_predict} if ollama_name and not stop_after else None,
@@ -542,6 +548,11 @@ def publish(
     no_cache: bool = typer.Option(False, "--no-cache", help="Force rebuild"),
     keep_work: bool = typer.Option(False, "--keep-work", help="Keep intermediate files"),
     cache_dir: Optional[Path] = typer.Option(None, "--cache-dir", help="Cache directory for HF downloads"),
+    olive_python: Optional[Path] = typer.Option(
+        None,
+        "--olive-python",
+        help="External Python interpreter used for Olive runs (fallback: NPU_MODEL_OLIVE_PYTHON).",
+    ),
 ) -> None:
     """One-command HF -> NPU -> Ollama publish.
 
@@ -570,7 +581,7 @@ def publish(
             registry=registry,
             mode=mode,
             compile_config={"strategy": effective_compile},
-            export_options={},
+            export_options={"olive_python": str(olive_python) if olive_python else None},
             pack_ollama_name=name,
             pack_ollama_opts={"num_ctx": num_ctx, "num_predict": num_predict},
             use_cache=not no_cache,

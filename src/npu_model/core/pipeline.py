@@ -406,6 +406,8 @@ def convert_model(
     quant_config["model_family"] = _model_family
     quant_config["model_type"] = mi.model_type
     quant_config["input_spec"] = input_spec
+    if export_options and export_options.get("olive_python"):
+        quant_config["olive_python"] = export_options.get("olive_python")
 
     if effective_quantizer_id != "passthrough":
         # Check model size — quantization loads the entire model into RAM.

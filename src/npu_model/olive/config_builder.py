@@ -13,7 +13,7 @@ from npu_model.core.types import GraphBundle
 SUPPORTED_OLIVE_LLM_FAMILIES: frozenset[str] = frozenset({"phi", "phi3", "llama"})
 
 _TEMPLATE_BY_FAMILY: dict[str, str] = {
-    "phi": "phi_qnn.json.j2",
+    "phi": "phi2_qnn.json.j2",
     "phi3": "phi_qnn.json.j2",
     "llama": "llama_qnn.json.j2",
 }

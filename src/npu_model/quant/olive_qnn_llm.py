@@ -7,12 +7,15 @@ produced artifacts back into the internal GraphBundle contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import sys
 from typing import Any
 
 from npu_model.core.errors import NpuModelError
 from npu_model.core.types import GraphBundle
 from npu_model.olive.artifacts import collect_olive_outputs
+from npu_model.olive.compat import probe_olive_python
 from npu_model.olive.config_builder import (
     SUPPORTED_OLIVE_LLM_FAMILIES,
     build_olive_config,
@@ -34,26 +37,6 @@ class OliveQnnLlmQuantizer:
     SUPPORTED_FAMILIES = SUPPORTED_OLIVE_LLM_FAMILIES
 
     def apply(self, graphs: GraphBundle, *, quant_config: dict[str, Any]) -> GraphBundle:
-        try:
-            import olive  # noqa: F401
-            _has_olive = True
-        except ImportError:
-            _has_olive = False
-
-        if not _has_olive:
-            raise NpuModelError(
-                stage="quant",
-                reason_code="OLIVE_NOT_INSTALLED",
-                message="The olive-qnn-llm quantizer requires Olive (olive-ai) to be installed.",
-                hint=(
-                    "Install Olive with QNN support:\n"
-                    "  pip install olive-ai[auto-opt]\n\n"
-                    "Then re-run with: --quant olive-qnn-llm\n\n"
-                    "Alternatively, use the generic (experimental) path:\n"
-                    "  --quant qnn-qdq --calib-prompts <prompts.txt>"
-                ),
-            )
-
         if not graphs.graphs:
             raise NpuModelError(
                 stage="quant",
@@ -61,11 +44,28 @@ class OliveQnnLlmQuantizer:
                 message="No input ONNX graphs were provided for olive-qnn-llm.",
             )
 
+        olive_python_raw = (
+            quant_config.get("olive_python")
+            or os.environ.get("NPU_MODEL_OLIVE_PYTHON")
+            or sys.executable
+        )
+        olive_python = Path(str(olive_python_raw))
+        report = probe_olive_python(olive_python)
+
+        import logging
+        _log = logging.getLogger("npu_model")
+        if not report.is_x64:
+            _log.warning(
+                "Olive interpreter is not x64 (%s). Quantization is recommended on x64 hosts.",
+                report.machine,
+            )
+
         first_graph = next(iter(graphs.graphs.values()))
         work_dir = Path(first_graph).parent / "_olive_qnn_llm"
 
         plan = build_olive_config(graphs=graphs, quant_config=quant_config, work_dir=work_dir)
         run_olive_cli(
+            python_exe=report.python_exe,
             config_path=plan.config_path,
             work_dir=work_dir,
             timeout_s=int(quant_config.get("olive_timeout_s", 14_400)),
