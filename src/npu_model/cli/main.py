@@ -54,10 +54,25 @@ def doctor() -> None:
     """Run preflight environment checks and show actionable remediation."""
     from npu_model.cli.doctor import run_doctor, print_doctor_report
 
-    checks = run_doctor()
-    all_ok = print_doctor_report(checks)
-    if not all_ok:
-        raise typer.Exit(code=1)
+    try:
+        checks = run_doctor()
+        all_ok = print_doctor_report(checks)
+        if not all_ok:
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        _handle_err(
+            NpuModelError(
+                stage="doctor",
+                reason_code="DOCTOR_CRASH",
+                message=f"doctor crashed unexpectedly: {type(e).__name__}: {e}",
+                hint=(
+                    "This is a bug in the doctor command. "
+                    "It should degrade to failed checks instead of crashing."
+                ),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

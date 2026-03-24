@@ -1,11 +1,13 @@
-"""npu-model doctor — preflight environment checker."""
+"""npu-model doctor - preflight environment checker."""
 from __future__ import annotations
 
+import json
 import os
 import platform
+import subprocess
 import sys
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 
 from rich import print as rprint
 from rich.table import Table
@@ -36,54 +38,122 @@ def _check_os() -> CheckResult:
     return CheckResult(name="OS / Arch", ok=True, detail=info)
 
 
-def _check_package(pkg: str, pip_name: str | None = None) -> CheckResult:
-    pip_name = pip_name or pkg
+def _check_package(
+    import_name: str,
+    pip_name: str | None = None,
+    dist_name: str | None = None,
+) -> CheckResult:
+    pip_name = pip_name or import_name
+    dist_name = dist_name or pip_name
     try:
-        mod = __import__(pkg)
-        ver = getattr(mod, "__version__", "unknown")
-        return CheckResult(name=pkg, ok=True, detail=f"v{ver}")
-    except ImportError:
+        ver = version(dist_name)
+        return CheckResult(name=import_name, ok=True, detail=f"v{ver}")
+    except PackageNotFoundError:
         return CheckResult(
-            name=pkg,
+            name=import_name,
             ok=False,
             detail="not installed",
             remediation=f"pip install {pip_name}",
         )
 
 
-def _check_ort_providers() -> CheckResult:
+def _probe_module_import(
+    module: str,
+    label: str,
+    remediation: str,
+    timeout: int = 15,
+) -> CheckResult:
+    code = f"import {module}; print(getattr({module}, '__version__', 'unknown'))"
     try:
-        import onnxruntime as ort
-        providers = ort.get_available_providers()
-        has_qnn = "QNNExecutionProvider" in providers
-        return CheckResult(
-            name="ORT QNN EP",
-            ok=has_qnn,
-            detail=f"providers: {', '.join(providers)}",
-            remediation="" if has_qnn else "pip install onnxruntime-qnn  (or ensure QNN libs on PATH)",
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
-    except ImportError:
+    except Exception as e:
+        return CheckResult(
+            name=label,
+            ok=False,
+            detail=f"probe failed ({type(e).__name__})",
+            remediation=remediation,
+        )
+
+    if result.returncode == 0:
+        ver = (result.stdout or "").strip() or "unknown"
+        return CheckResult(name=label, ok=True, detail=f"import ok (v{ver})")
+
+    err = (result.stderr or result.stdout or "").strip().splitlines()
+    detail = err[-1] if err else f"exit code {result.returncode}"
+    return CheckResult(
+        name=label,
+        ok=False,
+        detail=f"import failed: {detail}",
+        remediation=remediation,
+    )
+
+
+def _check_ort_providers() -> CheckResult:
+    code = (
+        "import json, onnxruntime as ort; "
+        "print(json.dumps(ort.get_available_providers()))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as e:
         return CheckResult(
             name="ORT QNN EP",
             ok=False,
-            detail="onnxruntime not installed",
-            remediation="pip install onnxruntime  (or onnxruntime-qnn for QNN support)",
+            detail=f"provider probe failed ({type(e).__name__})",
+            remediation="pip install onnxruntime-qnn  (or ensure QNN libs on PATH)",
         )
+
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip().splitlines()
+        detail = err[-1] if err else f"exit code {result.returncode}"
+        return CheckResult(
+            name="ORT QNN EP",
+            ok=False,
+            detail=f"provider probe failed: {detail}",
+            remediation="pip install onnxruntime-qnn  (or ensure QNN libs on PATH)",
+        )
+
+    try:
+        providers = json.loads((result.stdout or "").strip())
+    except Exception:
+        providers = []
+
+    has_qnn = "QNNExecutionProvider" in providers
+    return CheckResult(
+        name="ORT QNN EP",
+        ok=has_qnn,
+        detail=f"providers: {', '.join(providers)}" if providers else "(none)",
+        remediation="" if has_qnn else "pip install onnxruntime-qnn  (or ensure QNN libs on PATH)",
+    )
 
 
 def _check_olive() -> CheckResult:
-    try:
-        import olive  # type: ignore
-
-        ver = getattr(olive, "__version__", "unknown")
-        return CheckResult(name="olive-ai", ok=True, detail=f"v{ver}")
-    except Exception as e:
+    pkg = _check_package("olive-ai", "olive-ai[auto-opt]", dist_name="olive-ai")
+    if not pkg.ok:
+        return pkg
+    probe = _probe_module_import(
+        "olive",
+        "olive import",
+        "Install a compatible olive-ai build for this Python + architecture.",
+    )
+    if not probe.ok:
         return CheckResult(
             name="olive-ai",
             ok=False,
-            detail=f"unavailable ({type(e).__name__})",
-            remediation="pip install olive-ai[auto-opt]",
+            detail=probe.detail,
+            remediation=probe.remediation,
         )
+    return CheckResult(name="olive-ai", ok=True, detail=pkg.detail)
 
 
 def _check_machine_role() -> CheckResult:
@@ -112,8 +182,8 @@ def _check_machine_role() -> CheckResult:
 
 def _check_genai_builder() -> CheckResult:
     try:
-        import onnxruntime_genai  # noqa: F401
-    except ImportError:
+        ver = version("onnxruntime-genai")
+    except PackageNotFoundError:
         return CheckResult(
             name="ORT GenAI Builder",
             ok=False,
@@ -121,64 +191,31 @@ def _check_genai_builder() -> CheckResult:
             remediation="pip install onnxruntime-genai",
         )
 
-    # Try importing the builder — catch both "module not found" (builder absent)
-    # and transitive import errors (builder exists but a dependency like onnx_ir is missing).
-    builder_found = False
-    missing_dep: str | None = None
-    for import_path in (
-        "onnxruntime_genai.models.builder",
-        "onnxruntime_genai.models",
-    ):
-        try:
-            __import__(import_path)
-            builder_found = True
-            break
-        except ModuleNotFoundError as e:
-            # Distinguish "builder module missing" from "builder found but needs onnx_ir"
-            missing_name = getattr(e, "name", None) or ""
-            if missing_name and missing_name != import_path and not import_path.startswith(missing_name):
-                # A transitive dep is missing (e.g. onnx_ir)
-                missing_dep = missing_name
-                builder_found = True  # builder exists, just can't load
-                break
-        except ImportError:
-            continue
-
-    if missing_dep:
-        pip_name = missing_dep.replace("_", "-")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "onnxruntime_genai.models.builder", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as e:
         return CheckResult(
             name="ORT GenAI Builder",
             ok=False,
-            detail=f"builder found but missing dependency: {missing_dep}",
-            remediation=f"pip install {pip_name}  (or: pip install npu-model\\[export])",
+            detail=f"probe failed ({type(e).__name__})",
+            remediation="Install a compatible onnxruntime-genai build for this Python + architecture.",
         )
 
-    if not builder_found:
-        # Also check if the CLI entrypoint works
-        import subprocess, sys
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "onnxruntime_genai.models.builder", "--help"],
-                capture_output=True, timeout=10,
-            )
-            if result.returncode == 0:
-                builder_found = True
-        except Exception:
-            pass
+    if result.returncode == 0:
+        return CheckResult(name="ORT GenAI Builder", ok=True, detail=f"available (v{ver})")
 
-    if builder_found:
-        return CheckResult(name="ORT GenAI Builder", ok=True, detail="available")
-
-    ver = getattr(onnxruntime_genai, "__version__", "unknown")
+    err = (result.stderr or result.stdout or "").strip().splitlines()
+    detail = err[-1] if err else f"exit code {result.returncode}"
     return CheckResult(
         name="ORT GenAI Builder",
         ok=False,
-        detail=f"onnxruntime_genai v{ver} installed but builder module not found",
-        remediation=(
-            "Builder may not be included in this build/version. "
-            "Try: pip install -U onnxruntime-genai  or check "
-            "https://github.com/microsoft/onnxruntime-genai for ARM64 builder support."
-        ),
+        detail=f"unavailable: {detail}",
+        remediation="Install a compatible onnxruntime-genai build for this Python + architecture.",
     )
 
 
@@ -186,6 +223,7 @@ def _check_env_var(name: str, hint: str, *, required: bool = True) -> CheckResul
     val = os.environ.get(name)
     if val:
         from pathlib import Path
+
         exists = Path(val).is_dir()
         return CheckResult(
             name=name,
@@ -213,6 +251,7 @@ def _check_registry() -> list[CheckResult]:
     results: list[CheckResult] = []
     try:
         from npu_model.core.registry import Registry
+
         reg = Registry.load()
         for label, group in [
             ("Adapters", reg.adapters),
@@ -247,19 +286,29 @@ def run_doctor() -> list[CheckResult]:
     # Core deps
     checks.append(_check_package("typer"))
     checks.append(_check_package("rich"))
-    checks.append(_check_package("huggingface_hub", "huggingface_hub"))
+    checks.append(_check_package("huggingface_hub", "huggingface_hub", dist_name="huggingface_hub"))
 
     # Export deps
     checks.append(_check_package("torch"))
     checks.append(_check_package("transformers"))
     checks.append(_check_package("onnx", "onnx"))
-    checks.append(_check_package("onnx_ir", "onnx-ir"))
-    checks.append(_check_package("onnxruntime_genai", "onnxruntime-genai"))
+    checks.append(_check_package("onnx_ir", "onnx-ir", dist_name="onnx-ir"))
+    checks.append(_check_package("onnxruntime_genai", "onnxruntime-genai", dist_name="onnxruntime-genai"))
+    checks.append(_probe_module_import(
+        "onnxruntime_genai",
+        "onnxruntime_genai import",
+        "Reinstall matching onnxruntime-genai / onnxruntime wheels for this Python + architecture.",
+    ))
     checks.append(_check_genai_builder())
     checks.append(_check_olive())
 
     # Backend deps
-    checks.append(_check_package("onnxruntime", "onnxruntime"))
+    checks.append(_check_package("onnxruntime", "onnxruntime", dist_name="onnxruntime"))
+    checks.append(_probe_module_import(
+        "onnxruntime",
+        "onnxruntime import",
+        "Reinstall matching onnxruntime / onnxruntime-qnn wheels for this Python + architecture.",
+    ))
     checks.append(_check_ort_providers())
     checks.append(_check_machine_role())
     checks.append(_check_env_var(
@@ -306,13 +355,22 @@ def print_doctor_report(checks: list[CheckResult]) -> bool:
     else:
         failed = [c for c in checks if not c.ok]
         rprint(f"[yellow]{len(failed)} check(s) need attention.[/yellow]")
-        # Print install extras summary
-        needs_export = any(c.name in ("torch", "transformers", "onnxruntime_genai", "ORT GenAI Builder")
-                          and not c.ok for c in checks)
-        needs_qnn = any(c.name in ("ORT QNN EP",) and not c.ok for c in checks)
+        needs_export = any(
+            c.name in (
+                "torch",
+                "transformers",
+                "onnxruntime_genai",
+                "onnxruntime_genai import",
+                "ORT GenAI Builder",
+            )
+            and not c.ok
+            for c in checks
+        )
+        needs_qnn = any(c.name in ("onnxruntime import", "ORT QNN EP") and not c.ok for c in checks)
         if needs_export:
             rprint("  [bold]For export support:[/bold]  pip install npu-model\\[export]")
         if needs_qnn:
             rprint("  [bold]For QNN backend:[/bold]   pip install npu-model\\[qnn]")
 
     return all_ok
+

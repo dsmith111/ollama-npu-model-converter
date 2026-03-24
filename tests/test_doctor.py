@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from npu_model.cli.doctor import run_doctor, CheckResult
+from npu_model.cli.doctor import (
+    CheckResult,
+    _check_genai_builder,
+    _check_package,
+    _probe_module_import,
+    run_doctor,
+)
 
 
 def test_doctor_runs() -> None:
@@ -29,3 +35,27 @@ def test_doctor_registry_loads() -> None:
     assert len(reg_checks) > 0
     for c in reg_checks:
         assert c.ok is True
+
+
+def test_probe_module_import_handles_failure() -> None:
+    check = _probe_module_import(
+        "module_that_does_not_exist_xyz",
+        "missing import probe",
+        "install it",
+    )
+    assert isinstance(check, CheckResult)
+    assert check.ok is False
+    assert "import failed" in check.detail
+
+
+def test_check_package_uses_metadata_lookup() -> None:
+    # This should not try importing the module object itself.
+    check = _check_package("rich", "rich", dist_name="rich")
+    assert isinstance(check, CheckResult)
+    assert check.name == "rich"
+    assert check.ok is True
+
+
+def test_check_genai_builder_never_raises() -> None:
+    check = _check_genai_builder()
+    assert isinstance(check, CheckResult)
