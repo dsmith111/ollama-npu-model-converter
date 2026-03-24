@@ -55,25 +55,49 @@ def pack_for_ollama(
             hint="Ensure the input directory contains *.onnx, genai_config.json, and tokenizer files.",
         )
 
-    # --- NPU-only guard: refuse .onnx.data without context-cache artifacts ---
+    # --- NPU-only guard: compiled-only packaging contract ---
     collected_names = {f.name for f in files}
     has_data_files = any(n.endswith(".onnx.data") for n in collected_names)
     has_ctx_graphs = any("_ctx" in n and n.endswith(".onnx") for n in collected_names)
     has_qnn_bins = any(n.endswith(".bin") for n in collected_names)
+    non_ctx_onnx = sorted(n for n in collected_names if n.endswith(".onnx") and "_ctx" not in n)
 
-    if has_data_files and not has_ctx_graphs:
+    if has_data_files:
         raise NpuModelError(
             stage="pack",
-            reason_code="ONNX_DATA_WITHOUT_CTX",
+            reason_code="ONNX_DATA_NOT_ALLOWED",
             message=(
-                "Bundle contains .onnx.data (raw float weights) but no *_ctx.onnx "
-                "context-cache artifacts. This model will NOT run on the NPU and will "
-                "cause disk/memory pressure at runtime."
+                "Bundle contains .onnx.data (raw float weights). "
+                "Deployable NPU bundles must not contain external ONNX data files."
             ),
             hint=(
-                "Use --compile-strategy context-cache to generate QNN context-cache artifacts.\n"
-                "For prebuilt models, use --mode prebuilt-ort-genai with a properly prepared bundle."
+                "Run compile-context first and pack the resulting compiled bundle "
+                "(containing *_ctx.onnx + .bin)."
             ),
+        )
+    if non_ctx_onnx:
+        raise NpuModelError(
+            stage="pack",
+            reason_code="NON_CTX_ONNX_NOT_ALLOWED",
+            message=(
+                "Bundle contains non-context ONNX files. "
+                f"Only compiled wrappers are allowed: {non_ctx_onnx}"
+            ),
+            hint="Pack only the output of compile-context (compiled_bundle).",
+        )
+    if not has_ctx_graphs:
+        raise NpuModelError(
+            stage="pack",
+            reason_code="CTX_ONNX_REQUIRED",
+            message="No *_ctx.onnx context wrapper files found in bundle.",
+            hint="Run npu-model compile-context before pack-ollama.",
+        )
+    if not has_qnn_bins:
+        raise NpuModelError(
+            stage="pack",
+            reason_code="QNN_BIN_REQUIRED",
+            message="No .bin QNN context binaries found in bundle.",
+            hint="Run npu-model compile-context before pack-ollama.",
         )
 
     # --- atomic staging ---

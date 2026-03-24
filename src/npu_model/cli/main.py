@@ -12,6 +12,8 @@ from npu_model.core.errors import NpuModelError
 
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+handoff_app = typer.Typer(no_args_is_help=True, add_completion=False)
+app.add_typer(handoff_app, name="handoff")
 registry = Registry.load()
 
 
@@ -22,6 +24,25 @@ def _handle_err(e: Exception) -> None:
             rprint(f"[yellow]Hint:[/yellow] {e.hint}")
         raise typer.Exit(code=2)
     raise e
+
+
+# ---------------------------------------------------------------------------
+# handoff
+# ---------------------------------------------------------------------------
+
+@handoff_app.command("export")
+def handoff_export(
+    input: Path = typer.Option(..., "--input", help="Path to handoff bundle directory"),
+    out: Path = typer.Option(..., "--out", help="Output .zip path"),
+) -> None:
+    """Export a handoff bundle directory into a .zip for transfer."""
+    try:
+        from npu_model.core.handoff import export_handoff_zip
+
+        zip_path = export_handoff_zip(input, out)
+        rprint(f"[green]OK[/green] handoff zip: {zip_path}")
+    except Exception as e:
+        _handle_err(e)
 
 
 # ---------------------------------------------------------------------------
@@ -160,22 +181,26 @@ def convert(
     """Convert a model into a runtime bundle.
 
     When --pack-ollama is provided, auto-selects NPU-optimized defaults:
-      backend=qnn, quant=qnn-qdq, compile-strategy=context-cache
+      backend=qnn, quant=auto-family (olive-qnn-llm for supported LLMs), compile-strategy=context-cache
     """
     # ---- NPU preset: auto-select defaults when --pack-ollama is provided ----
     effective_quant = quant
     effective_compile = compile_strategy
+    quantizer_was_auto = False
 
     if ollama_name and mode != "prebuilt-ort-genai":
         if effective_quant is None:
-            effective_quant = "qnn-qdq"
-            rprint("[dim]Auto-selected:[/dim] --quant qnn-qdq (NPU requires QDQ quantization)")
+            quantizer_was_auto = True
+            rprint(
+                "[dim]Auto-selected:[/dim] --quant auto "
+                "(olive-qnn-llm for supported LLM families; qnn-qdq otherwise)"
+            )
         if effective_compile is None:
             effective_compile = "context-cache"
             rprint("[dim]Auto-selected:[/dim] --compile-strategy context-cache (NPU requires compiled artifacts)")
 
     # Defaults for non-NPU paths
-    if effective_quant is None:
+    if effective_quant is None and not quantizer_was_auto:
         effective_quant = "passthrough"
     if effective_compile is None:
         effective_compile = "passthrough"
@@ -188,6 +213,7 @@ def convert(
             target=target,
             runtime_format_id=runtime,
             quantizer_id=effective_quant,
+            quantizer_was_auto=quantizer_was_auto,
             cache_dir=cache_dir,
             registry=registry,
             mode=mode,
@@ -353,11 +379,14 @@ def _validate_runtime_load(check_dir: Path, prompt: str, max_tokens: int) -> Non
 @app.command("compile-context")
 def compile_context(
     input: Path = typer.Option(
-        ..., "--input", help="Path to handoff bundle or directory with QDQ ONNX + tokenizer",
+        ..., "--input", help="Path to handoff bundle directory or .zip",
     ),
     out: Path = typer.Option(..., "--out", help="Output directory for compiled artifacts"),
     backend: str = typer.Option("qnn", "--backend", help="Backend id"),
     target: str = typer.Option("auto", "--target", help="Target selection"),
+    allow_experimental: bool = typer.Option(
+        False, "--allow-experimental", help="Allow experimental generic LLM compile path",
+    ),
 ) -> None:
     """Generate QNN context-cache artifacts from a handoff bundle.
 
@@ -365,9 +394,9 @@ def compile_context(
     Input should be a handoff bundle produced by: convert --stop-after quantize
     """
     try:
-        from npu_model.core.handoff import load_handoff_bundle, validate_handoff_for_compile
+        from npu_model.core.handoff import load_handoff_input, validate_handoff_for_compile
 
-        graphs, metadata = load_handoff_bundle(input)
+        graphs, metadata = load_handoff_input(input)
 
         if not graphs.graphs:
             rprint("[bold red]Error[/bold red]: No ONNX graphs found in handoff bundle.")
@@ -377,7 +406,7 @@ def compile_context(
         validate_handoff_for_compile(
             metadata,
             compile_strategy="context-cache",
-            allow_experimental=False,
+            allow_experimental=allow_experimental,
         )
 
         rprint(f"[dim]Loaded handoff bundle:[/dim] {len(graphs.graphs)} graph(s)")
@@ -426,9 +455,28 @@ def compile_context(
                     shutil.copy2(p, final_dir / p.name)
         for p in graphs.extra_files:
             if p.exists() and p.is_file():
+                if p.name.endswith(".onnx.data"):
+                    continue
                 dst = final_dir / p.name
                 if not dst.exists():
                     shutil.copy2(p, dst)
+
+        if list(final_dir.rglob("*.onnx.data")):
+            rprint("[bold red]Error[/bold red]: Compiled bundle still contains .onnx.data files.")
+            raise typer.Exit(code=2)
+
+        from npu_model.validate.npu_strict import validate_npu_strict
+        npu_result = validate_npu_strict(final_dir)
+        if not npu_result.passed:
+            fail_details = [
+                f"  - {c.name}: {c.detail}"
+                for c in npu_result.checks
+                if c.status == "FAIL"
+            ]
+            rprint("[bold red]Error[/bold red]: Strict NPU validation failed after compile.")
+            for d in fail_details:
+                rprint(d)
+            raise typer.Exit(code=2)
 
         rprint(f"[green]OK[/green] compiled bundle: {final_dir}")
         rprint()
@@ -506,8 +554,9 @@ def publish(
         rprint(f"  mode:  {mode}")
         rprint()
 
-        effective_quant = "passthrough" if mode == "prebuilt-ort-genai" else "qnn-qdq"
+        effective_quant = "passthrough" if mode == "prebuilt-ort-genai" else None
         effective_compile = "passthrough" if mode == "prebuilt-ort-genai" else "context-cache"
+        quantizer_was_auto = mode != "prebuilt-ort-genai"
 
         result = convert_model(
             input_spec=input,
@@ -516,6 +565,7 @@ def publish(
             target="auto",
             runtime_format_id="ort-genai-folder",
             quantizer_id=effective_quant,
+            quantizer_was_auto=quantizer_was_auto,
             cache_dir=cache_dir,
             registry=registry,
             mode=mode,

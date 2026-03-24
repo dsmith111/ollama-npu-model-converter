@@ -218,7 +218,7 @@ class TestCtxWrapperSizeGuard:
 
 
 class TestOliveQnnLlmQuantizer:
-    """Tests for the olive-qnn-llm scaffold quantizer."""
+    """Tests for olive-qnn-llm integration surface."""
 
     def test_has_correct_id(self) -> None:
         from npu_model.quant.olive_qnn_llm import OliveQnnLlmQuantizer
@@ -226,7 +226,7 @@ class TestOliveQnnLlmQuantizer:
         assert q.id == "olive-qnn-llm"
         assert q.requires_calibration is False
 
-    def test_raises_not_implemented(self, tmp_path: Path) -> None:
+    def test_raises_when_unavailable_or_misconfigured(self, tmp_path: Path) -> None:
         from npu_model.quant.olive_qnn_llm import OliveQnnLlmQuantizer
 
         q = OliveQnnLlmQuantizer()
@@ -240,7 +240,8 @@ class TestOliveQnnLlmQuantizer:
             q.apply(bundle, quant_config={})
         assert exc_info.value.reason_code in (
             "OLIVE_NOT_INSTALLED",
-            "OLIVE_QNN_LLM_NOT_IMPLEMENTED",
+            "OLIVE_MODEL_FAMILY_UNSUPPORTED",
+            "OLIVE_RUN_FAILED",
         )
 
     def test_supported_families(self) -> None:

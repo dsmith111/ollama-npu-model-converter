@@ -13,10 +13,11 @@ from npu_model.runtime_formats.ort_genai_folder import (
 
 @pytest.fixture()
 def minimal_ortgenai_dir(tmp_path: Path) -> Path:
-    """Create a minimal valid ORT GenAI directory."""
+    """Create a minimal valid compiled ORT GenAI directory."""
     d = tmp_path / "ortgenai_src"
     d.mkdir()
-    (d / "embeddings.onnx").write_bytes(b"\x00" * 16)
+    (d / "decoder_ctx.onnx").write_bytes(b"\x00" * 16)
+    (d / "decoder_qnn.bin").write_bytes(b"\x00" * 2048)
     (d / "genai_config.json").write_text('{"model": {}}', encoding="utf-8")
     (d / "tokenizer.json").write_text('{"version": "1.0"}', encoding="utf-8")
     return d
@@ -31,7 +32,7 @@ class TestCollectOllamaFiles:
     def test_picks_up_onnx_json_tokenizer(self, minimal_ortgenai_dir: Path) -> None:
         files = collect_ollama_files(minimal_ortgenai_dir)
         names = {f.name for f in files}
-        assert "embeddings.onnx" in names
+        assert "decoder_ctx.onnx" in names
         assert "genai_config.json" in names
         assert "tokenizer.json" in names
 
@@ -117,9 +118,15 @@ class TestValidateOllamaOrtgenai:
         result = validate_ollama_ortgenai_dir(minimal_ortgenai_dir)
         assert any(".safetensors" in e for e in result.errors)
 
-    def test_warns_no_bin(self, minimal_ortgenai_dir: Path) -> None:
+    def test_missing_bin_is_error(self, minimal_ortgenai_dir: Path) -> None:
+        (minimal_ortgenai_dir / "decoder_qnn.bin").unlink()
         result = validate_ollama_ortgenai_dir(minimal_ortgenai_dir)
-        assert any("bin" in w.lower() for w in result.warnings)
+        assert any("bin" in e.lower() for e in result.errors)
+
+    def test_non_ctx_onnx_is_error(self, minimal_ortgenai_dir: Path) -> None:
+        (minimal_ortgenai_dir / "model.onnx").write_bytes(b"\x00")
+        result = validate_ollama_ortgenai_dir(minimal_ortgenai_dir)
+        assert any("non-ctx" in e.lower() for e in result.errors)
 
     def test_warns_no_chat_template(self, minimal_ortgenai_dir: Path) -> None:
         result = validate_ollama_ortgenai_dir(minimal_ortgenai_dir)
@@ -149,7 +156,8 @@ class TestPackForOllama:
         assert result.pack_dir.exists()
         names = {p.name for p in out.iterdir() if p.is_file()}
         assert "Modelfile" in names
-        assert "embeddings.onnx" in names
+        assert "decoder_ctx.onnx" in names
+        assert "decoder_qnn.bin" in names
         assert "genai_config.json" in names
         assert "tokenizer.json" in names
         assert "_publish_manifest.json" in names
@@ -186,6 +194,19 @@ class TestPackForOllama:
         )
         names = {p.name for p in out.iterdir()}
         assert "bad.gguf" not in names
+
+    def test_rejects_non_ctx_input(self, tmp_path: Path) -> None:
+        from npu_model.core.errors import NpuModelError
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "model.onnx").write_bytes(b"\x00")
+        (src / "decoder_qnn.bin").write_bytes(b"\x00" * 2048)
+        (src / "genai_config.json").write_text("{}", encoding="utf-8")
+        (src / "tokenizer.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(NpuModelError) as exc_info:
+            pack_for_ollama(bundle_dir=src, model_name="x/y:z", out_dir=tmp_path / "out")
+        assert exc_info.value.reason_code == "NON_CTX_ONNX_NOT_ALLOWED"
 
     def test_custom_params(self, minimal_ortgenai_dir: Path, tmp_path: Path) -> None:
         out = tmp_path / "pub"

@@ -33,6 +33,7 @@ export = [
 ]
 qnn = [
   "onnxruntime-qnn",
+  "olive-ai[auto-opt]",
 ]
 validate = [
   "onnxruntime-genai",
@@ -65,6 +66,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"npu_model.olive" = ["templates/*.j2"]
 
 [tool.ruff]
 line-length = 110

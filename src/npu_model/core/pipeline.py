@@ -115,7 +115,7 @@ def convert_model(
     backend_id: str,
     target: str,
     runtime_format_id: str,
-    quantizer_id: str,
+    quantizer_id: str | None,
     cache_dir: Optional[Path],
     registry: Registry,
     mode: str = "export",
@@ -126,6 +126,7 @@ def convert_model(
     use_cache: bool = True,
     keep_work: bool = False,
     stop_after: Optional[str] = None,
+    quantizer_was_auto: bool = False,
 ) -> ConvertResult:
     convert_mode = _resolve_mode(mode)
     out_dir = out_dir.expanduser().resolve()
@@ -153,18 +154,36 @@ def convert_model(
             message=f"Unknown runtime format: {runtime_format_id}",
             hint=f"Available: {sorted(registry.runtime_formats.keys())}",
         )
-    quantizer = registry.quantizers.get(quantizer_id)
+    cc = compile_config or {}
+    strategy = cc.get("strategy", "passthrough")
+    _SUPPORTED_OLIVE_FAMILIES = {"phi", "phi3", "llama"}
+    _model_family = (mi.model_type or "").lower()
+    effective_quantizer_id = quantizer_id or "passthrough"
+    if (
+        quantizer_was_auto
+        and backend_id == "qnn"
+        and strategy == "context-cache"
+    ):
+        effective_quantizer_id = (
+            "olive-qnn-llm" if _model_family in _SUPPORTED_OLIVE_FAMILIES else "qnn-qdq"
+        )
+        import logging
+        logging.getLogger("npu_model").info(
+            "Auto-selected quantizer for model_family='%s': %s",
+            _model_family or "unknown",
+            effective_quantizer_id,
+        )
+
+    quantizer = registry.quantizers.get(effective_quantizer_id)
     if quantizer is None:
         raise NpuModelError(
             stage="quant", reason_code="UNKNOWN_QUANTIZER",
-            message=f"Unknown quantizer: {quantizer_id}",
+            message=f"Unknown quantizer: {effective_quantizer_id}",
             hint=f"Available: {sorted(registry.quantizers.keys())}",
         )
 
     # Resolve backend target early (needed for cache key)
     ts = backend.resolve_target(target, env=dict(os.environ))
-    cc = compile_config or {}
-    strategy = cc.get("strategy", "passthrough")
 
     # ---- 2b. Check cache ----
     import npu_model
@@ -179,7 +198,7 @@ def convert_model(
         target_params=ts.params,
         compile_strategy=strategy,
         compile_config=cc,
-        quantizer_id=quantizer_id,
+        quantizer_id=effective_quantizer_id,
         runtime_format_id=runtime_format_id,
         tool_version=npu_model.__version__,
     )
@@ -208,14 +227,14 @@ def convert_model(
 
     # Auto-fix: when using a real quantizer (e.g. qnn-qdq), export in fp32 or fp16
     # so the quantizer handles quantization — don't let the builder try int4.
-    if quantizer_id != "passthrough":
+    if effective_quantizer_id != "passthrough":
         current_precision = export_config.get("precision", "int4")
         if current_precision == "int4":
             export_config["precision"] = "fp16"
             import logging
             logging.getLogger("npu_model").info(
                 "Auto-adjusted export precision from int4 to fp16 "
-                "(quantizer '%s' will handle quantization)", quantizer_id,
+                "(quantizer '%s' will handle quantization)", effective_quantizer_id,
             )
 
     try:
@@ -309,7 +328,7 @@ def convert_model(
         backend_id == "qnn"
         and ts.params.get("backend_type", "").lower() in ("htp", "")
     )
-    if is_npu_target and strategy == "context-cache" and quantizer_id == "passthrough":
+    if is_npu_target and strategy == "context-cache" and effective_quantizer_id == "passthrough":
         if pack_ollama_name:
             raise NpuModelError(
                 stage="pipeline",
@@ -333,11 +352,10 @@ def convert_model(
     # The generic qnn-qdq path is experimental for decoder LLMs.  Phi, Phi-3,
     # and Llama-family models need LLM-specific splitting/shaping (Olive).
     _LLM_FAMILY_TYPES = {"phi", "phi3", "llama", "llama2", "llama3", "mistral", "gemma"}
-    _model_family = (mi.model_type or "").lower()
     if (
         is_npu_target
         and strategy == "context-cache"
-        and quantizer_id == "qnn-qdq"
+        and effective_quantizer_id == "qnn-qdq"
         and _model_family in _LLM_FAMILY_TYPES
     ):
         _log.warning(
@@ -385,7 +403,11 @@ def convert_model(
 
     # ---- 6. Auto-calibration + Quantize ----
     quant_config: dict[str, Any] = {}
-    if quantizer_id != "passthrough":
+    quant_config["model_family"] = _model_family
+    quant_config["model_type"] = mi.model_type
+    quant_config["input_spec"] = input_spec
+
+    if effective_quantizer_id != "passthrough":
         # Check model size — quantization loads the entire model into RAM.
         # On memory-constrained devices, this silently crashes (SIGSEGV / OOM).
         total_model_bytes = sum(
@@ -506,6 +528,13 @@ def convert_model(
 
     # ---- 6b. Stop after quantize (for staged workflows) ----
     if stop_after == "quantize":
+        quant_format = (
+            "qdq"
+            if effective_quantizer_id in {"qnn-qdq", "olive-qnn-llm"}
+            else effective_quantizer_id
+        )
+        split_count = int(graphs.metadata.get("split_count", len(graphs.graphs)))
+        layout = str(graphs.metadata.get("layout", "split" if split_count > 1 else "monolith"))
         from npu_model.core.handoff import create_handoff_bundle
         handoff = create_handoff_bundle(
             graphs=graphs,
@@ -516,10 +545,10 @@ def convert_model(
                 "adapter_id": adapter_id,
                 "model_type": mi.model_type,
                 "model_family": (mi.model_type or "").lower(),
-                "quantizer_id": quantizer_id,
-                "quantization_format": "qdq" if quantizer_id == "qnn-qdq" else quantizer_id,
-                "split_count": len(graphs.graphs),
-                "layout": "monolith" if len(graphs.graphs) == 1 else "split",
+                "quantizer_id": effective_quantizer_id,
+                "quantization_format": quant_format,
+                "split_count": split_count,
+                "layout": layout,
                 "graph_metadata": graphs.metadata,
             },
         )
@@ -576,7 +605,7 @@ def convert_model(
         backend_id=backend_id,
         target_name=ts.name,
         runtime_format_id=runtime_format_id,
-        quantizer_id=quantizer_id,
+        quantizer_id=effective_quantizer_id,
         convert_mode=convert_mode.value,
     )
     manifest = {

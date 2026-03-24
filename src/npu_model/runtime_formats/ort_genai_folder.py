@@ -18,7 +18,6 @@ from npu_model.runtime_formats.base import RuntimeFormat
 # Extensions that Ollama will pick up when the primary detection is ONNX.
 _OLLAMA_ALLOW_EXTENSIONS: frozenset[str] = frozenset({
     ".onnx",
-    ".data",      # ONNX external data (e.g. model.onnx.data)
     ".bin",
     ".json",
     ".jinja",
@@ -82,6 +81,11 @@ def validate_ollama_ortgenai_dir(path: Path) -> OllamaOrtGenaiValidation:
     onnx_files = [n for n in all_names if n.lower().endswith(".onnx")]
     if not onnx_files:
         errors.append("No *.onnx files found (at least 1 required)")
+    elif any("_ctx" not in n.lower() for n in onnx_files):
+        errors.append(
+            "Pack input must contain compiled context wrappers only (*_ctx.onnx). "
+            f"Found non-ctx ONNX files: {[n for n in onnx_files if '_ctx' not in n.lower()]}"
+        )
 
     if "genai_config.json" not in all_names:
         errors.append("genai_config.json not found (required)")
@@ -99,16 +103,14 @@ def validate_ollama_ortgenai_dir(path: Path) -> OllamaOrtGenaiValidation:
     # --- soft warnings ---
     bin_files = [n for n in all_names if n.lower().endswith(".bin")]
     if not bin_files:
-        warnings.append("No *.bin files found (context binaries may be needed at runtime)")
+        errors.append("No *.bin files found (compiled QNN context binaries are required)")
 
     # Warn about ONNX external data files — Ollama may not materialize these
     data_files = [n for n in all_names if n.lower().endswith(".onnx.data")]
     if data_files:
-        warnings.append(
+        errors.append(
             f"ONNX external data files found: {data_files}. "
-            "Ollama may not handle these correctly yet. "
-            "Consider using INT4 precision (smaller model, single .onnx file) "
-            "or prebuilt-ort-genai mode."
+            "Deployable NPU bundles must not include .onnx.data."
         )
 
     if "chat_template.jinja" not in all_names:

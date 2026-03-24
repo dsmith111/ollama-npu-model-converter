@@ -71,6 +71,45 @@ def _check_ort_providers() -> CheckResult:
         )
 
 
+def _check_olive() -> CheckResult:
+    try:
+        import olive  # type: ignore
+
+        ver = getattr(olive, "__version__", "unknown")
+        return CheckResult(name="olive-ai", ok=True, detail=f"v{ver}")
+    except ImportError:
+        return CheckResult(
+            name="olive-ai",
+            ok=False,
+            detail="not installed",
+            remediation="pip install olive-ai[auto-opt]",
+        )
+
+
+def _check_machine_role() -> CheckResult:
+    machine = (platform.machine() or "").lower()
+    if machine in ("amd64", "x86_64"):
+        return CheckResult(
+            name="Machine Role",
+            ok=True,
+            detail="x64 host (recommended for export/quantize with Olive)",
+            warn=True,
+        )
+    if "arm64" in machine or "aarch64" in machine:
+        return CheckResult(
+            name="Machine Role",
+            ok=True,
+            detail="ARM64 host (recommended for compile/runtime on device)",
+            warn=True,
+        )
+    return CheckResult(
+        name="Machine Role",
+        ok=True,
+        detail=f"{machine or 'unknown'} (unable to classify host role)",
+        warn=True,
+    )
+
+
 def _check_genai_builder() -> CheckResult:
     try:
         import onnxruntime_genai  # noqa: F401
@@ -217,10 +256,12 @@ def run_doctor() -> list[CheckResult]:
     checks.append(_check_package("onnx_ir", "onnx-ir"))
     checks.append(_check_package("onnxruntime_genai", "onnxruntime-genai"))
     checks.append(_check_genai_builder())
+    checks.append(_check_olive())
 
     # Backend deps
     checks.append(_check_package("onnxruntime", "onnxruntime"))
     checks.append(_check_ort_providers())
+    checks.append(_check_machine_role())
     checks.append(_check_env_var(
         "QNN_SDK_ROOT",
         "Set QNN_SDK_ROOT to your Qualcomm AI Engine SDK directory.",

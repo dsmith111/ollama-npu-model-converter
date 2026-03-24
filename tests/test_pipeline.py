@@ -27,7 +27,8 @@ def phi3_prebuilt_dir(tmp_path: Path) -> Path:
     d.mkdir()
     shutil.copy2(FIXTURES / "hf_phi3_config.json", d / "config.json")
     (d / "tokenizer.json").write_text("{}", encoding="utf-8")
-    (d / "model.onnx").write_bytes(b"\x00" * 16)
+    (d / "model_ctx.onnx").write_bytes(b"\x00" * 16)
+    (d / "model_qnn.bin").write_bytes(b"\x00" * 4096)
     (d / "genai_config.json").write_text(
         json.dumps({"model": {"decoder": {"context_length": 4096}}, "search": {"max_length": 2048}}),
         encoding="utf-8",

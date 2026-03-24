@@ -359,6 +359,81 @@ class QnnBackend(Backend):
 
         del sess
 
+    def _validate_compiled_model_controls(
+        self,
+        *,
+        ctx_graphs: dict[str, Path],
+        backend_path: str,
+        require_fail_on_suboptimal: bool = True,
+    ) -> None:
+        """Load compiled wrappers with model compilation disabled.
+
+        This ensures deployable artifacts do not rely on implicit recompilation
+        at runtime.
+        """
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            return
+
+        for _name, graph_path in ctx_graphs.items():
+            qnn_provider_opts: dict[str, str] = {"backend_path": backend_path}
+
+            def _make_opts(*, with_fail_on_suboptimal: bool) -> Any:
+                sess_opts = ort.SessionOptions()
+                sess_opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+                sess_opts.add_session_config_entry("session.disable_model_compile", "1")
+                if with_fail_on_suboptimal:
+                    sess_opts.add_session_config_entry("session.fail_on_suboptimal_compiled_model", "1")
+                return sess_opts
+
+            try:
+                sess = ort.InferenceSession(
+                    str(graph_path),
+                    _make_opts(with_fail_on_suboptimal=require_fail_on_suboptimal),
+                    providers=["QNNExecutionProvider"],
+                    provider_options=[qnn_provider_opts],
+                )
+                del sess
+            except Exception as e:
+                msg = str(e)
+                if (
+                    require_fail_on_suboptimal
+                    and "fail_on_suboptimal_compiled_model" in msg.lower()
+                ):
+                    # Some ORT builds may not support this key; retry without it.
+                    try:
+                        sess = ort.InferenceSession(
+                            str(graph_path),
+                            _make_opts(with_fail_on_suboptimal=False),
+                            providers=["QNNExecutionProvider"],
+                            provider_options=[qnn_provider_opts],
+                        )
+                        del sess
+                        continue
+                    except Exception as e2:
+                        raise NpuModelError(
+                            stage="backend",
+                            reason_code="COMPILED_MODEL_VALIDATION_FAILED",
+                            message=(
+                                f"Compiled wrapper '{graph_path.name}' failed strict load "
+                                "(disable_model_compile=1)."
+                            ),
+                            hint=str(e2)[:800],
+                            cause=e2,
+                        ) from e2
+
+                raise NpuModelError(
+                    stage="backend",
+                    reason_code="COMPILED_MODEL_VALIDATION_FAILED",
+                    message=(
+                        f"Compiled wrapper '{graph_path.name}' failed strict load "
+                        "(disable_model_compile=1)."
+                    ),
+                    hint=msg[:800],
+                    cause=e,
+                ) from e
+
     # -------------------------------------------------------------------
     # compile (real compilation via ORT QNN EP context caching)
     # -------------------------------------------------------------------
@@ -706,6 +781,12 @@ class QnnBackend(Backend):
                     ),
                 )
 
+        self._validate_compiled_model_controls(
+            ctx_graphs=ctx_graphs,
+            backend_path=backend_path,
+            require_fail_on_suboptimal=bool(config.get("fail_on_suboptimal_compiled_model", True)),
+        )
+
         backend_metadata = {
             "backend": self.id,
             "target": target.name,
@@ -714,6 +795,7 @@ class QnnBackend(Backend):
             "ep_context_embed_mode": embed_mode,
             "ctx_graphs": [p.name for p in ctx_graphs.values()],
             "qnn_bins": [p.name for p in qnn_bins],
+            "compiled_model_validation": "strict",
         }
 
         return BackendPreparedBundle(

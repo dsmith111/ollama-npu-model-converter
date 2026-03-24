@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from npu_model.core.handoff import (
-    create_handoff_bundle, load_handoff_bundle, validate_handoff_for_compile,
+    create_handoff_bundle,
+    export_handoff_zip,
+    load_handoff_bundle,
+    load_handoff_input,
+    validate_handoff_for_compile,
 )
 from npu_model.core.errors import NpuModelError
 from npu_model.core.types import GraphBundle
@@ -104,6 +108,27 @@ class TestLoadHandoffBundle:
         assert loaded_graphs.tokenizer_dir.exists()
         assert meta.get("model_type") == "phi3"
 
+    def test_roundtrip_zip_input(self, tmp_path: Path, sample_graphs: GraphBundle) -> None:
+        out = tmp_path / "handoff"
+        create_handoff_bundle(
+            graphs=sample_graphs,
+            out_dir=out,
+            stopped_after="quantize",
+            metadata={
+                "model_type": "phi3",
+                "model_family": "phi3",
+                "quantization_format": "qdq",
+                "layout": "split",
+                "split_count": 2,
+                "quantizer_id": "olive-qnn-llm",
+            },
+        )
+        z = tmp_path / "handoff.zip"
+        export_handoff_zip(out, z)
+        loaded_graphs, meta = load_handoff_input(z)
+        assert "model" in loaded_graphs.graphs
+        assert meta.get("quantization_format") == "qdq"
+
     def test_enriched_manifest_metadata(self, tmp_path: Path, sample_graphs: GraphBundle) -> None:
         """Handoff manifest should include model_family, layout, split_count, etc."""
         out = tmp_path / "handoff"
@@ -180,10 +205,15 @@ class TestValidateHandoffForCompile:
             "model_family": "phi3",
             "layout": "monolith",
             "quantization_format": "qdq",
+            "split_count": 1,
+            "quantizer_id": "qnn-qdq",
         }
         with pytest.raises(NpuModelError) as exc_info:
             validate_handoff_for_compile(meta, compile_strategy="context-cache")
-        assert exc_info.value.reason_code == "MONOLITHIC_LLM_QDQ_EXPERIMENTAL"
+        assert exc_info.value.reason_code in (
+            "HANDOFF_LAYOUT_UNSUPPORTED",
+            "MONOLITHIC_LLM_QDQ_EXPERIMENTAL",
+        )
 
     def test_allows_monolithic_llm_qdq_when_experimental(self) -> None:
         """With allow_experimental=True, monolithic LLM QDQ passes."""
@@ -192,6 +222,8 @@ class TestValidateHandoffForCompile:
             "model_family": "phi3",
             "layout": "monolith",
             "quantization_format": "qdq",
+            "split_count": 1,
+            "quantizer_id": "qnn-qdq",
         }
         # Should NOT raise
         validate_handoff_for_compile(
@@ -215,6 +247,8 @@ class TestValidateHandoffForCompile:
             "model_family": "llama",
             "layout": "split",
             "quantization_format": "qdq",
+            "split_count": 2,
+            "quantizer_id": "olive-qnn-llm",
         }
         validate_handoff_for_compile(meta, compile_strategy="context-cache")
 
@@ -223,7 +257,9 @@ class TestValidateHandoffForCompile:
         meta = {"stopped_after": "export"}
         validate_handoff_for_compile(meta, compile_strategy="passthrough")
 
-    def test_missing_metadata_is_lenient(self) -> None:
-        """When metadata lacks enriched fields, validation is lenient."""
+    def test_missing_quantization_format_is_rejected(self) -> None:
+        """Strict compile contract now requires quantization_format=qdq."""
         meta = {"stopped_after": "quantize"}
-        validate_handoff_for_compile(meta, compile_strategy="context-cache")
+        with pytest.raises(NpuModelError) as exc_info:
+            validate_handoff_for_compile(meta, compile_strategy="context-cache")
+        assert exc_info.value.reason_code == "HANDOFF_NOT_QDQ"
