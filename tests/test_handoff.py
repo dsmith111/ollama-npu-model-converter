@@ -101,6 +101,29 @@ class TestLoadHandoffBundle:
         assert loaded_graphs.tokenizer_dir.exists()
         assert meta.get("model_type") == "phi3"
 
+    def test_enriched_manifest_metadata(self, tmp_path: Path, sample_graphs: GraphBundle) -> None:
+        """Handoff manifest should include model_family, layout, split_count, etc."""
+        out = tmp_path / "handoff"
+        hb = create_handoff_bundle(
+            graphs=sample_graphs,
+            out_dir=out,
+            stopped_after="quantize",
+            metadata={
+                "model_type": "phi3",
+                "model_family": "phi3",
+                "quantizer_id": "qnn-qdq",
+                "quantization_format": "qdq",
+                "split_count": 1,
+                "layout": "monolith",
+            },
+        )
+        manifest = json.loads(hb.manifest_path.read_text(encoding="utf-8"))
+        meta = manifest["metadata"]
+        assert meta["model_family"] == "phi3"
+        assert meta["quantization_format"] == "qdq"
+        assert meta["split_count"] == 1
+        assert meta["layout"] == "monolith"
+
     def test_detects_external_data(self, tmp_path: Path, sample_graphs: GraphBundle) -> None:
         out = tmp_path / "handoff"
         create_handoff_bundle(

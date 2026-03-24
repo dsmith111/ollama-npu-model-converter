@@ -55,6 +55,7 @@ ort-genai-folder = "npu_model.runtime_formats.ort_genai_folder:OrtGenaiFolderFor
 [project.entry-points."npu_model.quantizers"]
 passthrough = "npu_model.quant.passthrough:PassthroughQuantizer"
 qnn-qdq = "npu_model.quant.qnn_qdq:QnnQdqQuantizer"
+olive-qnn-llm = "npu_model.quant.olive_qnn_llm:OliveQnnLlmQuantizer"
 
 [project.entry-points."npu_model.exporters"]
 ort-genai-builder = "npu_model.exporters.ort_genai_builder:OrtGenaiBuilderExporter"

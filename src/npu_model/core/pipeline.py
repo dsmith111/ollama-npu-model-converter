@@ -291,6 +291,10 @@ def convert_model(
                 "input_spec": input_spec,
                 "adapter_id": adapter_id,
                 "model_type": mi.model_type,
+                "model_family": (mi.model_type or "").lower(),
+                "quantization_format": None,
+                "split_count": len(graphs.graphs),
+                "layout": "monolith" if len(graphs.graphs) == 1 else "split",
                 "graph_metadata": graphs.metadata,
             },
         )
@@ -324,6 +328,25 @@ def convert_model(
                 "QNN HTP context-cache compilation with passthrough quantizer. "
                 "The model may not be quantized — HTP requires QDQ quantization."
             )
+
+    # ---- 4f. Policy: warn LLM families using generic QDQ for context-cache ----
+    # The generic qnn-qdq path is experimental for decoder LLMs.  Phi, Phi-3,
+    # and Llama-family models need LLM-specific splitting/shaping (Olive).
+    _LLM_FAMILY_TYPES = {"phi", "phi3", "llama", "llama2", "llama3", "mistral", "gemma"}
+    _model_family = (mi.model_type or "").lower()
+    if (
+        is_npu_target
+        and strategy == "context-cache"
+        and quantizer_id == "qnn-qdq"
+        and _model_family in _LLM_FAMILY_TYPES
+    ):
+        _log.warning(
+            "Model family '%s' is using the generic qnn-qdq quantizer with "
+            "context-cache compilation.  This path is EXPERIMENTAL for LLMs and "
+            "may produce oversized or invalid context artifacts.\n"
+            "For production deployment, use: --quant olive-qnn-llm",
+            _model_family,
+        )
 
     # ---- 5. Shape fixing (required for QNN HTP) ----
     num_ctx_val = (pack_ollama_opts or {}).get("num_ctx", 512)
@@ -492,7 +515,11 @@ def convert_model(
                 "input_spec": input_spec,
                 "adapter_id": adapter_id,
                 "model_type": mi.model_type,
+                "model_family": (mi.model_type or "").lower(),
                 "quantizer_id": quantizer_id,
+                "quantization_format": "qdq" if quantizer_id == "qnn-qdq" else quantizer_id,
+                "split_count": len(graphs.graphs),
+                "layout": "monolith" if len(graphs.graphs) == 1 else "split",
                 "graph_metadata": graphs.metadata,
             },
         )

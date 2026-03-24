@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from typing import Any
 from npu_model.backends.base import Backend
 from npu_model.core.errors import NpuModelError
 from npu_model.core.types import BackendCapabilities, GraphBundle, BackendPreparedBundle, TargetSpec
+
+_log = logging.getLogger("npu_model.backend.qnn")
 
 
 @dataclass
@@ -129,6 +132,19 @@ class QnnBackend(Backend):
     # QNN op compatibility check
     # -------------------------------------------------------------------
 
+    # Ops that are structurally incompatible (wrong quant format).
+    _INCOMPATIBLE_OPS = frozenset({"MatMulNBits"})
+
+    # Ops known to be unsupported or problematic on QNN HTP in monolithic
+    # decoder graphs.  A graph dominated by these will not compile into a
+    # compact context binary.
+    _HTP_RISKY_OPS = frozenset({
+        "LayerNormalization", "SkipLayerNormalization",
+        "FastGelu", "BiasGelu",
+        "GroupQueryAttention", "MultiHeadAttention",
+        "RotaryEmbedding",
+    })
+
     def _check_qnn_compatible_ops(self, graphs: GraphBundle) -> None:
         """Check ONNX graphs for ops that are incompatible with QNN HTP.
 
@@ -141,8 +157,6 @@ class QnnBackend(Backend):
         except ImportError:
             return  # can't check without onnx
 
-        _INCOMPATIBLE_OPS = {"MatMulNBits"}
-
         for name, graph_path in graphs.graphs.items():
             try:
                 model = onnx.load(str(graph_path), load_external_data=False)
@@ -151,7 +165,7 @@ class QnnBackend(Backend):
 
             incompatible = set()
             for node in model.graph.node:
-                if node.op_type in _INCOMPATIBLE_OPS:
+                if node.op_type in self._INCOMPATIBLE_OPS:
                     incompatible.add(node.op_type)
 
             if incompatible:
@@ -175,6 +189,81 @@ class QnnBackend(Backend):
                         "which is a different format not supported by QNN HTP."
                     ),
                 )
+
+    def _audit_htp_op_coverage(self, graphs: GraphBundle) -> dict[str, set[str]]:
+        """Return per-graph sets of ops known to be risky on QNN HTP.
+
+        Does NOT raise — callers decide the policy.
+        """
+        try:
+            import onnx
+        except ImportError:
+            return {}
+
+        results: dict[str, set[str]] = {}
+        for name, graph_path in graphs.graphs.items():
+            try:
+                model = onnx.load(str(graph_path), load_external_data=False)
+            except Exception:
+                continue
+            risky = {n.op_type for n in model.graph.node if n.op_type in self._HTP_RISKY_OPS}
+            if risky:
+                results[name] = risky
+        return results
+
+    # -------------------------------------------------------------------
+    # HTP eligibility probe (no-fallback tiny run)
+    # -------------------------------------------------------------------
+
+    def _probe_htp_eligibility(
+        self,
+        graph_path: Path,
+        backend_path: str,
+        graph_name: str,
+    ) -> None:
+        """Run a no-fallback probe session to verify the graph can execute
+        entirely on QNN HTP before attempting context-cache generation.
+
+        Uses ``session.disable_cpu_ep_fallback=1`` with ep.context_enable
+        left OFF so we get a clean pass/fail signal without writing artifacts.
+        """
+        import onnxruntime as ort
+
+        sess_opts = ort.SessionOptions()
+        # Strict NPU-only — fails if any op falls back to CPU
+        sess_opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+
+        qnn_opts: dict[str, str] = {"backend_path": backend_path}
+
+        try:
+            sess = ort.InferenceSession(
+                str(graph_path),
+                sess_opts,
+                providers=["QNNExecutionProvider"],
+                provider_options=[qnn_opts],
+            )
+            del sess
+        except Exception as e:
+            err_str = str(e)
+            raise NpuModelError(
+                stage="backend",
+                reason_code="HTP_PROBE_FAILED",
+                message=(
+                    f"Graph '{graph_name}' cannot run entirely on QNN HTP. "
+                    f"Context-cache generation would fail or produce invalid artifacts.\n"
+                    f"Probe error: {err_str[:500]}"
+                ),
+                hint=(
+                    "This typically means the QDQ graph still contains ops that QNN HTP "
+                    "cannot execute.\n\n"
+                    "The generic QDQ quantization path is experimental for LLMs.\n"
+                    "For production deployment of Phi / Phi-3 / Llama models on QNN HTP, "
+                    "use the Olive-backed pipeline:\n"
+                    "  npu-model convert --quant olive-qnn-llm ...\n\n"
+                    "For details, see docs/plugin_dev.md"
+                ),
+                cause=e,
+            ) from e
 
     # -------------------------------------------------------------------
     # compile (real compilation via ORT QNN EP context caching)
@@ -321,6 +410,16 @@ class QnnBackend(Backend):
         # Pre-flight: check for incompatible quantization formats
         self._check_qnn_compatible_ops(graphs)
 
+        # Pre-flight: audit op coverage and warn about risky ops
+        risky_ops = self._audit_htp_op_coverage(graphs)
+        if risky_ops:
+            for gname, ops in risky_ops.items():
+                _log.warning(
+                    "Graph '%s' contains ops that are often unsupported on QNN HTP: %s. "
+                    "Context-cache compilation may fail or produce oversized artifacts.",
+                    gname, sorted(ops),
+                )
+
         backend_path = target.params.get("backend_path", "QnnHtp.dll")
         embed_mode = config.get("ep_context_embed_mode", "0")
 
@@ -340,6 +439,11 @@ class QnnBackend(Backend):
         context_errors: list[str] = []
         for name, src_path in graphs.graphs.items():
             graph_in_compile = compile_dir / src_path.name
+
+            # ---- HTP eligibility probe ----
+            # Run a no-context session with disable_cpu_ep_fallback to verify
+            # the graph can execute entirely on QNN HTP before dumping context.
+            self._probe_htp_eligibility(graph_in_compile, backend_path, name)
 
             # ep.context_file_path: ORT uses this as the output path for the
             # generated context model. Pass the compile directory — ORT will
@@ -457,6 +561,33 @@ class QnnBackend(Backend):
                 message="Context-cache compilation produced _ctx.onnx but no .bin artifacts.",
                 hint="Expected QNN compiled binary alongside context ONNX wrapper.",
             )
+
+        # Output size guard: a valid context wrapper should be compact (< 10 MB).
+        # If the _ctx.onnx is enormous, context serialization likely embedded the
+        # full weights instead of producing a separate .bin — this is not a usable
+        # deployment artifact.
+        _MAX_CTX_WRAPPER_BYTES = 10 * 1024 * 1024  # 10 MB
+        for gname, ctx_path in ctx_graphs.items():
+            ctx_size = ctx_path.stat().st_size
+            if ctx_size > _MAX_CTX_WRAPPER_BYTES:
+                ctx_mb = ctx_size / (1024 * 1024)
+                raise NpuModelError(
+                    stage="backend",
+                    reason_code="CTX_WRAPPER_OVERSIZED",
+                    message=(
+                        f"Context wrapper '{ctx_path.name}' is {ctx_mb:.0f} MB — "
+                        f"expected a compact wrapper (< 10 MB)."
+                    ),
+                    hint=(
+                        "An oversized _ctx.onnx means context serialization embedded the full "
+                        "model weights instead of producing a separate .bin binary.\n\n"
+                        "This usually happens when QNN HTP could not compile all ops, causing "
+                        "ORT to fall back to embedding raw weights.\n\n"
+                        "For LLMs (Phi, Llama), use the Olive-backed pipeline:\n"
+                        "  npu-model convert --quant olive-qnn-llm ...\n"
+                        "Or try ep_context_embed_mode=0 (separate .bin)."
+                    ),
+                )
 
         backend_metadata = {
             "backend": self.id,
