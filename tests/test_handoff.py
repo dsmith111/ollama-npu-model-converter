@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from npu_model.core.handoff import create_handoff_bundle, load_handoff_bundle
+from npu_model.core.handoff import (
+    create_handoff_bundle, load_handoff_bundle, validate_handoff_for_compile,
+)
+from npu_model.core.errors import NpuModelError
 from npu_model.core.types import GraphBundle
 
 
@@ -143,3 +146,84 @@ class TestLoadHandoffBundle:
 
         loaded, meta = load_handoff_bundle(d)
         assert "model" in loaded.graphs
+
+    def test_warns_on_missing_enriched_fields(self, tmp_path: Path, sample_graphs: GraphBundle, caplog) -> None:
+        """load_handoff_bundle should warn when enriched metadata is missing."""
+        import logging
+        out = tmp_path / "handoff"
+        # Create with old-style metadata (no enriched fields)
+        create_handoff_bundle(
+            graphs=sample_graphs, out_dir=out, stopped_after="export",
+            metadata={"model_type": "phi3"},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="npu_model.handoff"):
+            load_handoff_bundle(out)
+
+        assert any("missing enriched metadata" in r.message for r in caplog.records)
+
+
+class TestValidateHandoffForCompile:
+    """Tests for validate_handoff_for_compile gating."""
+
+    def test_rejects_export_handoff_for_context_cache(self) -> None:
+        """An export-stage handoff must be rejected for context-cache."""
+        meta = {"stopped_after": "export", "model_family": "phi3"}
+        with pytest.raises(NpuModelError) as exc_info:
+            validate_handoff_for_compile(meta, compile_strategy="context-cache")
+        assert exc_info.value.reason_code == "HANDOFF_NOT_QUANTIZED"
+
+    def test_rejects_monolithic_llm_qdq(self) -> None:
+        """Monolithic QDQ from a known LLM family must be rejected."""
+        meta = {
+            "stopped_after": "quantize",
+            "model_family": "phi3",
+            "layout": "monolith",
+            "quantization_format": "qdq",
+        }
+        with pytest.raises(NpuModelError) as exc_info:
+            validate_handoff_for_compile(meta, compile_strategy="context-cache")
+        assert exc_info.value.reason_code == "MONOLITHIC_LLM_QDQ_EXPERIMENTAL"
+
+    def test_allows_monolithic_llm_qdq_when_experimental(self) -> None:
+        """With allow_experimental=True, monolithic LLM QDQ passes."""
+        meta = {
+            "stopped_after": "quantize",
+            "model_family": "phi3",
+            "layout": "monolith",
+            "quantization_format": "qdq",
+        }
+        # Should NOT raise
+        validate_handoff_for_compile(
+            meta, compile_strategy="context-cache", allow_experimental=True,
+        )
+
+    def test_allows_non_llm_monolithic_qdq(self) -> None:
+        """A non-LLM family monolithic QDQ should pass."""
+        meta = {
+            "stopped_after": "quantize",
+            "model_family": "wav2vec",
+            "layout": "monolith",
+            "quantization_format": "qdq",
+        }
+        validate_handoff_for_compile(meta, compile_strategy="context-cache")
+
+    def test_allows_split_llm_qdq(self) -> None:
+        """A split (non-monolith) LLM QDQ should pass."""
+        meta = {
+            "stopped_after": "quantize",
+            "model_family": "llama",
+            "layout": "split",
+            "quantization_format": "qdq",
+        }
+        validate_handoff_for_compile(meta, compile_strategy="context-cache")
+
+    def test_passthrough_strategy_skips_gates(self) -> None:
+        """Passthrough strategy should not trigger any gate."""
+        meta = {"stopped_after": "export"}
+        validate_handoff_for_compile(meta, compile_strategy="passthrough")
+
+    def test_missing_metadata_is_lenient(self) -> None:
+        """When metadata lacks enriched fields, validation is lenient."""
+        meta = {"stopped_after": "quantize"}
+        validate_handoff_for_compile(meta, compile_strategy="context-cache")

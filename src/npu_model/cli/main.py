@@ -365,13 +365,20 @@ def compile_context(
     Input should be a handoff bundle produced by: convert --stop-after quantize
     """
     try:
-        from npu_model.core.handoff import load_handoff_bundle
+        from npu_model.core.handoff import load_handoff_bundle, validate_handoff_for_compile
 
         graphs, metadata = load_handoff_bundle(input)
 
         if not graphs.graphs:
             rprint("[bold red]Error[/bold red]: No ONNX graphs found in handoff bundle.")
             raise typer.Exit(code=2)
+
+        # Validate the handoff bundle is compatible with context-cache
+        validate_handoff_for_compile(
+            metadata,
+            compile_strategy="context-cache",
+            allow_experimental=False,
+        )
 
         rprint(f"[dim]Loaded handoff bundle:[/dim] {len(graphs.graphs)} graph(s)")
         for name, p in graphs.graphs.items():

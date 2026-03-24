@@ -132,14 +132,12 @@ class TestQnnCompatibleOps:
 
 
 class TestHtpProbe:
-    """Tests for _probe_htp_eligibility."""
+    """Tests for _probe_htp_eligibility with real synthetic feed."""
 
     def test_probe_raises_on_session_failure(self) -> None:
         """If InferenceSession raises, probe must raise HTP_PROBE_FAILED."""
         backend = QnnBackend()
 
-        # Mock ort.InferenceSession to raise without loading a real model,
-        # because ORT may crash the process (native abort) on invalid inputs.
         mock_ort = MagicMock()
         mock_ort.SessionOptions.return_value = MagicMock()
         mock_ort.InferenceSession.side_effect = RuntimeError("QNN EP not available")
@@ -151,6 +149,62 @@ class TestHtpProbe:
                 )
         assert exc_info.value.reason_code == "HTP_PROBE_FAILED"
         assert "QNN EP not available" in exc_info.value.message
+
+    def test_probe_raises_on_run_failure(self, tmp_path: Path) -> None:
+        """If session.run() raises, probe must raise HTP_PROBE_FAILED."""
+        onnx = pytest.importorskip("onnx")
+        from onnx import TensorProto
+        from onnx.helper import make_graph, make_model, make_node, make_tensor_value_info, make_opsetid
+
+        # Build a valid ONNX model so _build_synthetic_feed can parse it
+        inputs = [make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])]
+        outputs = [make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])]
+        graph = make_graph([make_node("Identity", ["X"], ["Y"])], "test", inputs, outputs)
+        model = make_model(graph, opset_imports=[make_opsetid("", 17)])
+        model_path = tmp_path / "probe_model.onnx"
+        onnx.save(model, str(model_path))
+
+        backend = QnnBackend()
+
+        # Session creation succeeds but run() fails
+        mock_sess = MagicMock()
+        mock_sess.run.side_effect = RuntimeError("Op not supported on HTP")
+
+        mock_ort = MagicMock()
+        mock_ort.SessionOptions.return_value = MagicMock()
+        mock_ort.InferenceSession.return_value = mock_sess
+
+        with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
+            with pytest.raises(NpuModelError) as exc_info:
+                backend._probe_htp_eligibility(model_path, "QnnHtp.dll", "model")
+        assert exc_info.value.reason_code == "HTP_PROBE_FAILED"
+        assert "inference failed" in exc_info.value.message
+
+    def test_build_synthetic_feed(self, tmp_path: Path) -> None:
+        """_build_synthetic_feed should produce zero-tensors for all inputs."""
+        onnx = pytest.importorskip("onnx")
+        np = pytest.importorskip("numpy")
+        from onnx import TensorProto
+        from onnx.helper import make_graph, make_model, make_node, make_tensor_value_info, make_opsetid
+
+        inputs = [
+            make_tensor_value_info("input_ids", TensorProto.INT64, [1, 32]),
+            make_tensor_value_info("kv_cache", TensorProto.FLOAT, [1, 4, 8, 16]),
+        ]
+        outputs = [make_tensor_value_info("Y", TensorProto.FLOAT, [1, 32, 100])]
+        graph = make_graph([make_node("Identity", ["input_ids"], ["Y"])], "test", inputs, outputs)
+        model = make_model(graph, opset_imports=[make_opsetid("", 17)])
+        model_path = tmp_path / "feed_model.onnx"
+        onnx.save(model, str(model_path))
+
+        feed = QnnBackend._build_synthetic_feed(model_path)
+        assert "input_ids" in feed
+        assert "kv_cache" in feed
+        assert feed["input_ids"].shape == (1, 32)
+        assert feed["input_ids"].dtype == np.int64
+        assert feed["kv_cache"].shape == (1, 4, 8, 16)
+        assert feed["kv_cache"].dtype == np.float32
+        assert np.all(feed["kv_cache"] == 0)
 
 
 class TestCtxWrapperSizeGuard:

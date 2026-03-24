@@ -21,17 +21,32 @@ Layout::
             genai_config.json
             chat_template.jinja
             ...
+
+Manifest metadata contract (enriched fields)::
+
+    metadata.model_type          — HF model_type string (e.g. "phi3")
+    metadata.model_family        — lowercased family key (e.g. "phi3", "llama")
+    metadata.adapter_id          — adapter that produced the graphs
+    metadata.quantizer_id        — quantizer used (e.g. "qnn-qdq")
+    metadata.quantization_format — "qdq", "passthrough", or None
+    metadata.split_count         — number of graph splits
+    metadata.layout              — "monolith" or "split"
+    metadata.graph_metadata      — adapter-provided graph metadata dict
 """
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from npu_model.core.errors import NpuModelError
 from npu_model.core.manifest import collect_files, write_manifest
 from npu_model.core.types import GraphBundle
+
+_log = logging.getLogger("npu_model.handoff")
 
 
 @dataclass(frozen=True)
@@ -97,13 +112,30 @@ def create_handoff_bundle(
 
 
 def load_handoff_bundle(bundle_dir: Path) -> tuple[GraphBundle, dict[str, Any]]:
-    """Load a handoff bundle back into a GraphBundle + metadata."""
+    """Load a handoff bundle back into a GraphBundle + metadata.
+
+    Validates that enriched metadata fields are present when a manifest
+    exists, and logs warnings for missing optional fields.
+    """
     bundle_dir = bundle_dir.expanduser().resolve()
 
     manifest_path = bundle_dir / "handoff_manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         metadata = manifest.get("metadata", {})
+
+        # Validate enriched metadata — warn on missing fields so callers
+        # know the bundle is from an older tool version.
+        _EXPECTED_FIELDS = [
+            "model_family", "quantization_format", "split_count", "layout",
+        ]
+        missing = [f for f in _EXPECTED_FIELDS if f not in metadata]
+        if missing:
+            _log.warning(
+                "Handoff manifest is missing enriched metadata fields: %s. "
+                "Bundle may have been created by an older tool version.",
+                ", ".join(missing),
+            )
     else:
         metadata = {}
 
@@ -139,3 +171,78 @@ def load_handoff_bundle(bundle_dir: Path) -> tuple[GraphBundle, dict[str, Any]]:
     )
 
     return bundle, metadata
+
+
+# LLM families for which the generic monolithic QDQ path is experimental.
+_LLM_FAMILIES = frozenset({
+    "phi", "phi3", "llama", "llama2", "llama3", "mistral", "gemma",
+})
+
+
+def validate_handoff_for_compile(
+    metadata: dict[str, Any],
+    *,
+    compile_strategy: str,
+    allow_experimental: bool = False,
+) -> None:
+    """Validate that a handoff bundle is compatible with the requested
+    compile strategy.  Raises ``NpuModelError`` if the bundle should not
+    be compiled through the requested path.
+
+    Parameters
+    ----------
+    metadata:
+        The ``metadata`` dict from ``load_handoff_bundle()``.
+    compile_strategy:
+        The compile strategy that will be used (e.g. ``"context-cache"``).
+    allow_experimental:
+        If ``True``, skip the monolithic-LLM rejection gate
+        (user explicitly opted in).
+    """
+    stopped_after = metadata.get("stopped_after") or metadata.get("handoff_stage")
+    model_family = (metadata.get("model_family") or "").lower()
+    layout = (metadata.get("layout") or "").lower()
+    quant_format = metadata.get("quantization_format")
+
+    # Gate 1: context-cache requires a quantized handoff
+    if compile_strategy in ("context-cache", "ort-ep-context"):
+        if stopped_after == "export":
+            raise NpuModelError(
+                stage="backend",
+                reason_code="HANDOFF_NOT_QUANTIZED",
+                message=(
+                    "This handoff bundle stopped after 'export' — it has not been "
+                    "quantized.  Context-cache compilation requires a QDQ-quantized bundle."
+                ),
+                hint=(
+                    "Re-run quantization first:\n"
+                    "  npu-model convert --input <bundle> --stop-after quantize "
+                    "--quant qnn-qdq --calib-prompts <prompts.txt>"
+                ),
+            )
+
+        # Gate 2: monolithic LLM + generic QDQ → experimental, warn or block
+        if (
+            model_family in _LLM_FAMILIES
+            and layout == "monolith"
+            and quant_format == "qdq"
+            and not allow_experimental
+        ):
+            raise NpuModelError(
+                stage="backend",
+                reason_code="MONOLITHIC_LLM_QDQ_EXPERIMENTAL",
+                message=(
+                    f"Handoff bundle is a monolithic QDQ graph for model family "
+                    f"'{model_family}'.  This compile path is experimental for LLMs "
+                    f"and is likely to produce oversized or invalid context artifacts."
+                ),
+                hint=(
+                    "Options:\n"
+                    "  1. Use the Olive-backed LLM pipeline (recommended):\n"
+                    "       npu-model convert --quant olive-qnn-llm ...\n"
+                    "  2. Use a prebuilt model:\n"
+                    "       --mode prebuilt-ort-genai\n"
+                    "  3. Opt into experimental generic path (at your own risk):\n"
+                    "       --compile-opt allow_experimental=true"
+                ),
+            )

@@ -212,8 +212,55 @@ class QnnBackend(Backend):
         return results
 
     # -------------------------------------------------------------------
-    # HTP eligibility probe (no-fallback tiny run)
+    # HTP eligibility probe (no-fallback tiny run with synthetic feed)
     # -------------------------------------------------------------------
+
+    @staticmethod
+    def _build_synthetic_feed(graph_path: Path) -> dict[str, Any]:
+        """Build a minimal all-zeros feed dict for every input in the graph.
+
+        Used by the HTP eligibility probe so it can call ``sess.run()``
+        instead of relying solely on session creation (which may not
+        surface per-op failures on some ORT/QNN builds).
+        """
+        import numpy as np
+
+        try:
+            import onnx
+            from onnx import TensorProto
+        except ImportError:
+            return {}
+
+        _ONNX_DTYPE_MAP = {
+            TensorProto.INT32: np.int32,
+            TensorProto.INT64: np.int64,
+            TensorProto.FLOAT: np.float32,
+            TensorProto.FLOAT16: np.float16,
+            TensorProto.UINT8: np.uint8,
+            TensorProto.INT8: np.int8,
+        }
+
+        try:
+            model = onnx.load(str(graph_path), load_external_data=False)
+        except Exception:
+            return {}
+
+        feed: dict[str, Any] = {}
+        for inp in model.graph.input:
+            if not inp.type.HasField("tensor_type"):
+                continue
+            dtype = _ONNX_DTYPE_MAP.get(inp.type.tensor_type.elem_type, np.float32)
+            shape_proto = inp.type.tensor_type.shape
+            if shape_proto is None:
+                continue
+            dims: list[int] = []
+            for dim in shape_proto.dim:
+                if dim.dim_value > 0:
+                    dims.append(dim.dim_value)
+                else:
+                    dims.append(1)  # symbolic → 1 for probe
+            feed[inp.name] = np.zeros(dims, dtype=dtype)
+        return feed
 
     def _probe_htp_eligibility(
         self,
@@ -221,11 +268,22 @@ class QnnBackend(Backend):
         backend_path: str,
         graph_name: str,
     ) -> None:
-        """Run a no-fallback probe session to verify the graph can execute
-        entirely on QNN HTP before attempting context-cache generation.
+        """Run a no-fallback probe session **with a real synthetic feed** to
+        verify the graph can execute entirely on QNN HTP before attempting
+        context-cache generation.
 
-        Uses ``session.disable_cpu_ep_fallback=1`` with ep.context_enable
-        left OFF so we get a clean pass/fail signal without writing artifacts.
+        The probe:
+          1. Creates a session with ``session.disable_cpu_ep_fallback=1`` and
+             ep.context_enable left OFF.
+          2. Builds an all-zeros feed for every graph input.
+          3. Calls ``sess.run(None, feed)`` — which forces ORT to actually
+             partition and execute every op on QNN.  Session creation alone
+             is not sufficient because some ORT/QNN combinations defer op
+             validation until run time.
+
+        If either session creation or the run fails, a clear
+        ``HTP_PROBE_FAILED`` error is raised directing the user to the
+        Olive-backed LLM path.
         """
         import onnxruntime as ort
 
@@ -242,15 +300,14 @@ class QnnBackend(Backend):
                 providers=["QNNExecutionProvider"],
                 provider_options=[qnn_opts],
             )
-            del sess
         except Exception as e:
             err_str = str(e)
             raise NpuModelError(
                 stage="backend",
                 reason_code="HTP_PROBE_FAILED",
                 message=(
-                    f"Graph '{graph_name}' cannot run entirely on QNN HTP. "
-                    f"Context-cache generation would fail or produce invalid artifacts.\n"
+                    f"Graph '{graph_name}' cannot be loaded on QNN HTP "
+                    f"(session creation failed).\n"
                     f"Probe error: {err_str[:500]}"
                 ),
                 hint=(
@@ -264,6 +321,43 @@ class QnnBackend(Backend):
                 ),
                 cause=e,
             ) from e
+
+        # Build a synthetic feed and run inference to validate ops at
+        # execution time, not just at graph-load time.
+        feed = self._build_synthetic_feed(graph_path)
+        if feed:
+            try:
+                sess.run(None, feed)
+            except Exception as e:
+                err_str = str(e)
+                raise NpuModelError(
+                    stage="backend",
+                    reason_code="HTP_PROBE_FAILED",
+                    message=(
+                        f"Graph '{graph_name}' loaded on QNN HTP but inference failed "
+                        f"with a synthetic feed.\n"
+                        f"Probe error: {err_str[:500]}"
+                    ),
+                    hint=(
+                        "Session creation succeeded but running the graph failed.  "
+                        "This usually means some ops are partially supported (loadable "
+                        "but not executable) on HTP.\n\n"
+                        "The generic QDQ quantization path is experimental for LLMs.\n"
+                        "For production deployment of Phi / Phi-3 / Llama models, "
+                        "use:\n"
+                        "  npu-model convert --quant olive-qnn-llm ...\n\n"
+                        "For details, see docs/plugin_dev.md"
+                    ),
+                    cause=e,
+                ) from e
+        else:
+            _log.warning(
+                "Could not build synthetic feed for HTP probe of '%s' — "
+                "probe relied on session creation only.",
+                graph_name,
+            )
+
+        del sess
 
     # -------------------------------------------------------------------
     # compile (real compilation via ORT QNN EP context caching)
@@ -561,6 +655,29 @@ class QnnBackend(Backend):
                 message="Context-cache compilation produced _ctx.onnx but no .bin artifacts.",
                 hint="Expected QNN compiled binary alongside context ONNX wrapper.",
             )
+
+        # .bin size floor: a real compiled QNN binary is at least several KB.
+        # An implausibly tiny .bin (< 1 KB) means the compiler produced a stub
+        # rather than a real context binary.
+        _MIN_QNN_BIN_BYTES = 1024  # 1 KB
+        for bin_path in qnn_bins:
+            bin_size = bin_path.stat().st_size
+            if bin_size < _MIN_QNN_BIN_BYTES:
+                raise NpuModelError(
+                    stage="backend",
+                    reason_code="QNN_BIN_TOO_SMALL",
+                    message=(
+                        f"Compiled binary '{bin_path.name}' is only {bin_size} bytes — "
+                        f"expected at least {_MIN_QNN_BIN_BYTES} bytes for a real context binary."
+                    ),
+                    hint=(
+                        "An implausibly small .bin usually means QNN compilation produced "
+                        "a stub or empty context.  The compiled graph may be too simple or "
+                        "the QNN SDK could not compile the graph into HTP instructions.\n\n"
+                        "Check QNN SDK version compatibility and ensure the model is properly "
+                        "QDQ-quantized."
+                    ),
+                )
 
         # Output size guard: a valid context wrapper should be compact (< 10 MB).
         # If the _ctx.onnx is enormous, context serialization likely embedded the
