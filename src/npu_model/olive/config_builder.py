@@ -78,7 +78,8 @@ def _render_template(template_path: Path, values: dict[str, Any]) -> str:
     text = template_path.read_text(encoding="utf-8")
     for key, value in values.items():
         token_pattern = re.compile(r"{{\s*" + re.escape(key) + r"\s*}}")
-        text = token_pattern.sub(str(value), text)
+        replacement = str(value)
+        text = token_pattern.sub(lambda _m, r=replacement: r, text)
     return text
 
 
@@ -124,10 +125,16 @@ def build_olive_config(
     try:
         parsed = json.loads(config_text)
     except Exception as e:
+        bad_path = work_dir / f"olive_{family}_qnn_config.rendered.invalid.json"
+        bad_path.write_text(config_text, encoding="utf-8")
         raise NpuModelError(
             stage="quant",
             reason_code="OLIVE_TEMPLATE_RENDER_FAILED",
             message=f"Failed to render valid Olive config from template: {template_path}",
+            hint=(
+                f"Rendered config was written to: {bad_path}\n"
+                f"JSON parse error: {type(e).__name__}: {e}"
+            ),
             cause=e,
         ) from e
     config_path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
