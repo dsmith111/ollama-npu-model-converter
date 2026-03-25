@@ -54,3 +54,31 @@ def test_build_olive_config_writes_invalid_render_for_diagnostics(
     assert bad_file.exists()
     assert bad_file.read_text(encoding="utf-8") == "{bad json"
 
+
+def test_build_olive_config_uses_target_not_engine(tmp_path: Path) -> None:
+    graph = tmp_path / "model.onnx"
+    graph.write_bytes(b"\x00" * 16)
+    tok_dir = tmp_path / "tokenizer"
+    tok_dir.mkdir()
+    bundle = GraphBundle(
+        graphs={"decoder": graph},
+        tokenizer_dir=tok_dir,
+        extra_files=[],
+        metadata={},
+    )
+
+    plan = config_builder.build_olive_config(
+        graphs=bundle,
+        quant_config={"model_family": "phi"},
+        work_dir=tmp_path / "work",
+    )
+    config = json.loads(plan.config_path.read_text(encoding="utf-8"))
+
+    assert "engine" not in config
+    assert config["target"] == "qnn_system"
+    assert "cache_dir" in config
+    assert config.get("evaluate_input_model") is False
+    assert config.get("no_artifacts") is False
+    assert config["input_model"]["type"] == "OnnxModel"
+    assert "model_path" in config["input_model"]
+    assert "config" not in config["input_model"]

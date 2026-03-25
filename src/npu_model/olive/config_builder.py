@@ -112,6 +112,8 @@ def build_olive_config(
     work_dir.mkdir(parents=True, exist_ok=True)
     output_dir = work_dir / "olive_output"
     output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = work_dir / "olive_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     config_path = work_dir / f"olive_{family}_qnn_config.json"
 
     model_source = quant_config.get("olive_model_source") or str(primary_graph)
@@ -119,7 +121,8 @@ def build_olive_config(
         "family": family,
         "input_model_path": json.dumps(str(model_source)),
         "output_dir": json.dumps(str(output_dir)),
-        "tokenizer_dir": json.dumps(str(graphs.tokenizer_dir)),
+        "cache_dir": json.dumps(str(cache_dir)),
+        "target_system": json.dumps("qnn_system"),
     }
     config_text = _render_template(template_path, template_values)
     try:

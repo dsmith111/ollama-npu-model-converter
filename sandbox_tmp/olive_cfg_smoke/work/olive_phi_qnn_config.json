@@ -2,7 +2,7 @@
   "workflow_id": "npu_model_phi2_qnn_llm",
   "input_model": {
     "type": "OnnxModel",
-    "model_path": {{ input_model_path }}
+    "model_path": "c:\\Users\\smithdavi\\repos\\ollama-npu-model-converter\\sandbox_tmp\\olive_cfg_smoke\\model.onnx"
   },
   "systems": {
     "qnn_system": {
@@ -28,9 +28,9 @@
       "type": "OnnxQuantizationPreprocess"
     }
   },
-  "target": {{ target_system }},
-  "output_dir": {{ output_dir }},
-  "cache_dir": {{ cache_dir }},
+  "target": "qnn_system",
+  "output_dir": "c:\\Users\\smithdavi\\repos\\ollama-npu-model-converter\\sandbox_tmp\\olive_cfg_smoke\\work\\olive_output",
+  "cache_dir": "c:\\Users\\smithdavi\\repos\\ollama-npu-model-converter\\sandbox_tmp\\olive_cfg_smoke\\work\\olive_cache",
   "no_artifacts": false,
   "evaluate_input_model": false
 }

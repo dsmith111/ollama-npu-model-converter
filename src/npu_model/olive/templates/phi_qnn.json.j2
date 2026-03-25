@@ -2,17 +2,14 @@
   "workflow_id": "npu_model_{{ family }}_qnn_llm",
   "input_model": {
     "type": "OnnxModel",
-    "config": {
-      "model_path": {{ input_model_path }},
-      "tokenizer_path": {{ tokenizer_dir }}
-    }
+    "model_path": {{ input_model_path }}
   },
   "systems": {
-    "local_system": {
+    "qnn_system": {
       "type": "LocalSystem",
       "accelerators": [
         {
-          "device": "cpu",
+          "device": "npu",
           "execution_providers": [
             "QNNExecutionProvider"
           ]
@@ -31,13 +28,9 @@
       "type": "OnnxQuantizationPreprocess"
     }
   },
-  "engine": {
-    "host": "local_system",
-    "target": "local_system",
-    "execution_providers": [
-      "QNNExecutionProvider"
-    ]
-  },
-  "output_dir": {{ output_dir }}
+  "target": {{ target_system }},
+  "output_dir": {{ output_dir }},
+  "cache_dir": {{ cache_dir }},
+  "no_artifacts": false,
+  "evaluate_input_model": false
 }
-

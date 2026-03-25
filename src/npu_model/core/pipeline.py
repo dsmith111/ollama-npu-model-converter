@@ -406,6 +406,12 @@ def convert_model(
     quant_config["model_family"] = _model_family
     quant_config["model_type"] = mi.model_type
     quant_config["input_spec"] = input_spec
+    quant_config["model_dir"] = str(model_dir)
+    quant_config["model_info"] = {
+        "source": dict(mi.source),
+        "model_type": mi.model_type,
+        "architectures": list(mi.architectures),
+    }
     if export_options and export_options.get("olive_python"):
         quant_config["olive_python"] = export_options.get("olive_python")
 
