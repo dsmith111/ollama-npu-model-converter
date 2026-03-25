@@ -13,10 +13,11 @@ class OliveEnvReport:
     python_exe: Path
     version: tuple[int, int, int]
     machine: str
-    olive_import_ok: bool
-    olive_error: str | None
-    ort_import_ok: bool
-    ort_error: str | None
+    olive_installed: bool
+    olive_version: str | None
+    runtime_import_checked: bool = False
+    runtime_import_ok: bool | None = None
+    runtime_import_error: str | None = None
 
     @property
     def version_str(self) -> str:
@@ -29,8 +30,19 @@ class OliveEnvReport:
         return m in {"x86_64", "amd64"}
 
 
-def probe_olive_python(python_exe: Path) -> OliveEnvReport:
-    """Probe an external interpreter for Olive compatibility."""
+def probe_olive_python(
+    python_exe: Path,
+    *,
+    deep_import_probe: bool = False,
+    deep_probe_timeout: int = 60,
+) -> OliveEnvReport:
+    """Fast probe for Olive host interpreter compatibility.
+
+    This probe is intentionally lightweight: it checks interpreter arch/version
+    and whether the ``olive-ai`` distribution is installed via metadata.
+    It does NOT import olive or onnxruntime. Runtime validation is deferred to
+    the actual runner invocation.
+    """
     python_exe = python_exe.expanduser().resolve()
     if not python_exe.exists():
         raise NpuModelError(
@@ -41,25 +53,19 @@ def probe_olive_python(python_exe: Path) -> OliveEnvReport:
         )
 
     probe_script = (
+        "from importlib.metadata import PackageNotFoundError, version\n"
         "import json, platform, sys\n"
         "result = {\n"
         "  'version': [sys.version_info[0], sys.version_info[1], sys.version_info[2]],\n"
         "  'machine': platform.machine(),\n"
-        "  'olive_import_ok': False,\n"
-        "  'olive_error': None,\n"
-        "  'ort_import_ok': False,\n"
-        "  'ort_error': None,\n"
+        "  'olive_installed': False,\n"
+        "  'olive_version': None,\n"
         "}\n"
         "try:\n"
-        "  import olive  # noqa: F401\n"
-        "  result['olive_import_ok'] = True\n"
-        "except BaseException as e:\n"
-        "  result['olive_error'] = f'{type(e).__name__}: {e}'\n"
-        "try:\n"
-        "  import onnxruntime  # noqa: F401\n"
-        "  result['ort_import_ok'] = True\n"
-        "except BaseException as e:\n"
-        "  result['ort_error'] = f'{type(e).__name__}: {e}'\n"
+        "  result['olive_version'] = version('olive-ai')\n"
+        "  result['olive_installed'] = True\n"
+        "except PackageNotFoundError:\n"
+        "  pass\n"
         "print(json.dumps(result))\n"
     )
 
@@ -69,7 +75,7 @@ def probe_olive_python(python_exe: Path) -> OliveEnvReport:
             capture_output=True,
             text=True,
             check=True,
-            timeout=90,
+            timeout=15,
         )
     except subprocess.TimeoutExpired as e:
         raise NpuModelError(
@@ -107,10 +113,8 @@ def probe_olive_python(python_exe: Path) -> OliveEnvReport:
         python_exe=python_exe,
         version=version,
         machine=str(payload.get("machine") or "unknown"),
-        olive_import_ok=bool(payload.get("olive_import_ok")),
-        olive_error=payload.get("olive_error"),
-        ort_import_ok=bool(payload.get("ort_import_ok")),
-        ort_error=payload.get("ort_error"),
+        olive_installed=bool(payload.get("olive_installed")),
+        olive_version=payload.get("olive_version"),
     )
 
     if report.version >= (3, 14, 0):
@@ -127,17 +131,64 @@ def probe_olive_python(python_exe: Path) -> OliveEnvReport:
             ),
         )
 
-    if not report.olive_import_ok:
+    if not report.olive_installed:
         raise NpuModelError(
             stage="quant",
             reason_code="OLIVE_NOT_INSTALLED",
-            message=f"Olive import failed in external interpreter: {report.python_exe}",
+            message=f"'olive-ai' is not installed in external interpreter: {report.python_exe}",
             hint=(
-                f"Error: {report.olive_error or 'unknown'}\n"
                 "Install Olive in that interpreter:\n"
                 f"  {report.python_exe} -m pip install olive-ai[auto-opt]"
             ),
         )
 
-    return report
+    if deep_import_probe:
+        deep_code = (
+            "import olive\n"
+            "print('ok')\n"
+        )
+        try:
+            deep = subprocess.run(
+                [str(python_exe), "-c", deep_code],
+                capture_output=True,
+                text=True,
+                timeout=deep_probe_timeout,
+            )
+        except Exception as e:
+            return OliveEnvReport(
+                python_exe=report.python_exe,
+                version=report.version,
+                machine=report.machine,
+                olive_installed=report.olive_installed,
+                olive_version=report.olive_version,
+                runtime_import_checked=True,
+                runtime_import_ok=False,
+                runtime_import_error=f"{type(e).__name__}: {e}",
+            )
 
+        if deep.returncode == 0:
+            return OliveEnvReport(
+                python_exe=report.python_exe,
+                version=report.version,
+                machine=report.machine,
+                olive_installed=report.olive_installed,
+                olive_version=report.olive_version,
+                runtime_import_checked=True,
+                runtime_import_ok=True,
+                runtime_import_error=None,
+            )
+
+        err = (deep.stderr or deep.stdout or "").strip().splitlines()
+        detail = err[-1] if err else f"exit code {deep.returncode}"
+        return OliveEnvReport(
+            python_exe=report.python_exe,
+            version=report.version,
+            machine=report.machine,
+            olive_installed=report.olive_installed,
+            olive_version=report.olive_version,
+            runtime_import_checked=True,
+            runtime_import_ok=False,
+            runtime_import_error=detail,
+        )
+
+    return report

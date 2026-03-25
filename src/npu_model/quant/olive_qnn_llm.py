@@ -54,6 +54,8 @@ class OliveQnnLlmQuantizer:
 
         import logging
         _log = logging.getLogger("npu_model")
+        if report.olive_version:
+            _log.info("Using external Olive interpreter: %s (olive-ai %s)", report.python_exe, report.olive_version)
         if not report.is_x64:
             _log.warning(
                 "Olive interpreter is not x64 (%s). Quantization is recommended on x64 hosts.",
